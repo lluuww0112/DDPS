@@ -1,0 +1,82 @@
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+# Optional video path support. LLaVA-1.5 is an image VLM, so video inputs are
+# represented as a sampled contact sheet before entering the VQA path.
+frame_selection:
+  _target_: model.video.uniform_sampling
+  _partial_: true
+  num_frames: 10
+  max_side: 720
+
+
+patch_selection:
+  _partial_: true
+  query_file: ${invoke.query_file}
+  clip_model_name: "openai/clip-vit-large-patch14"
+  clip_dtype: "bf16"
+  clip_do_center_crop: false 
+  keep_ratio: 0.3
+  batch_size: 8
+  video:
+    _target_: model.video.maskclip_patch_selection
+    _partial_: ${patch_selection._partial_}
+    query_file: ${patch_selection.query_file}
+    clip_model_name: ${patch_selection.clip_model_name}
+    clip_dtype: ${patch_selection.clip_dtype}
+    clip_do_center_crop: ${patch_selection.clip_do_center_crop}
+    keep_ratio: ${patch_selection.keep_ratio}
+    total_budget: null
+    temperature: 0.4
+    patch_score_threshold: 0.02
+    batch_size: ${patch_selection.batch_size}
+  vqa:
+    _target_: model.DDPS.maskclip_patch_selection
+    _partial_: ${patch_selection._partial_}
+    query_file: ${patch_selection.query_file}
+    clip_model_name: ${patch_selection.clip_model_name}
+    clip_dtype: ${patch_selection.clip_dtype}
+    clip_do_center_crop: ${patch_selection.clip_do_center_crop}
+    keep_ratio: ${patch_selection.keep_ratio}
+    batch_size: ${patch_selection.batch_size}
+
+
+vlm:
+  _target_: model.vlm.BaseVLM
+  model_id: "llava-hf/llava-1.5-7b-hf"
+  backend: "llava"
+  dtype: "bf16"
+  quantization:
+    enabled: false
+    mode: "4bit"
+    skip_vision_encoder: true
+    skip_modules: []
+    kwargs:
+      bnb_4bit_compute_dtype: "bf16"
+      bnb_4bit_quant_type: "nf4"
+      bnb_4bit_use_double_quant: true
+      llm_int8_threshold: 6.0
+      llm_int8_enable_fp32_cpu_offload: false
+  frame_selector: ${frame_selection}
+  patch_selector: ${patch_selection.video}
+  image_max_side: null
+  contact_sheet_columns: null
+  processor_kwargs: {}
+  model_kwargs: {}
+  local_model_dir: "./model/repo"
+  generation_kwargs:
+    do_sample: false
+    max_new_tokens: 128
+
+invoke:
+  task: "video" # Enum[ "video" | "vqa" ]
+  image_path: null
+  video_path: null
+  prompt_file: "model/prompt.txt"
+  query_file: "model/query.txt"
+  print_config: false
+  quiet_model_loading: false

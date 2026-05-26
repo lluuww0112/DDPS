@@ -1,0 +1,1 @@
+pip install --no-cache-dir bitsandbytes==0.49.2 accelerate==1.13.0 huggingface_hub==1.6.0 hydra-core==1.3.2 numpy==2.2.6 omegaconf==2.3.0 opencv-python==4.13.0.92 safetensors==0.7.0 transformers==5.3.0 yt-dlp==2026.3.17

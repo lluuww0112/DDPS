@@ -1,0 +1,26 @@
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+print_config: false
+
+egoschema_val:
+  input_file: "./eval/result/ego_pred.jsonl"
+  url: "https://validation-server.onrender.com/api/upload/"
+  timeout: 120
+  dry_run: false
+
+nextqa_val:
+  input_file: "./eval/result/nextqa_pred.jsonl"
+  dataset_root: "/content/drive/MyDrive/NExTVideo/nextqa"
+  questions_file: "/content/drive/MyDrive/NExTVideo/nextqa/val.csv"
+
+videomme_val:
+  results_file: "./eval/result/videomme_results.json"

@@ -1,0 +1,7 @@
+[SYSTEM]
+Chat between a human and an artificial intelligence visual question answering assistant.
+
+[USER]
+Answer the question based on the image.
+
+Question: {query}

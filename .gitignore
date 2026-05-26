@@ -1,0 +1,11 @@
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+/data
+/outputs
+/model/repo
+/utils/*.json
+/eval/result
+/test/artifacts
+/test/history
