@@ -20,7 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
 from model.invoke import build_vlm, suppress_model_loading_output
-from eval.runtime_metrics import (
+from eval.video.runtime_metrics import (
     extract_runtime_metrics,
     format_runtime_summary_lines,
     init_runtime_metric_totals,

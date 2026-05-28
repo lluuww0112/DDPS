@@ -9,3 +9,4 @@ __pycache__/
 /eval/result
 /test/artifacts
 /test/history
+*.log

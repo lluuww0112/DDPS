@@ -17,7 +17,6 @@ frame_selection:
   num_frames: 10
   max_side: 720
 
-
 vlm:
   _target_: model.vlm.BaseVLM
   model_id: "llava-hf/llava-1.5-7b-hf"
@@ -52,4 +51,4 @@ invoke:
   prompt_file: "model/prompt.txt"
   query_file: "model/query.txt"
   print_config: false
-  quiet_model_loading: false
+  quiet_model_loading: true

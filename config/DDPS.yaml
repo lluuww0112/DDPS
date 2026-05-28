@@ -73,10 +73,10 @@ vlm:
     max_new_tokens: 128
 
 invoke:
-  task: "video" # Enum[ "video" | "vqa" ]
-  image_path: null
+  task: "vqa" # Enum[ "video" | "vqa" ]
+  image_path: "./data/image.png"
   video_path: null
   prompt_file: "model/prompt.txt"
   query_file: "model/query.txt"
   print_config: false
-  quiet_model_loading: false
+  quiet_model_loading: true

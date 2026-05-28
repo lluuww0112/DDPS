@@ -31,6 +31,7 @@ from .vqa.selection import load_image
 PatchSelector = Callable[..., Any]
 FrameSelector = Callable[..., torch.Tensor | FrameSelectionResult | None]
 PromptInput = str | Mapping[str, Any]
+PromptBatchInput = PromptInput | Sequence[PromptInput]
 
 
 DTYPE_MAP = {
@@ -72,6 +73,44 @@ def _sanitize_model_id_for_path(model_id: str) -> str:
     )
 
 
+def _materialize_batch_sequence(values: Sequence[Any], *, label: str) -> list[Any]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(f"`{label}` must be a sequence, not a single value.")
+    return list(values)
+
+
+def _is_prompt_batch(prompt: Any) -> bool:
+    return isinstance(prompt, Sequence) and not isinstance(
+        prompt,
+        (str, bytes, Mapping),
+    )
+
+
+def _expand_batch_prompts(
+    prompt: PromptBatchInput,
+    *,
+    batch_size: int,
+) -> list[PromptInput]:
+    if _is_prompt_batch(prompt):
+        prompts = list(prompt)
+        if len(prompts) != batch_size:
+            raise ValueError(
+                "`prompt` batch length must match the visual batch length: "
+                f"prompts={len(prompts)}, visuals={batch_size}."
+            )
+        return prompts
+    return [prompt] * batch_size
+
+
+def _normalize_max_batch_size(batch_size: int | None) -> int | None:
+    if batch_size is None:
+        return None
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"`batch_size` must be positive, got {batch_size}.")
+    return batch_size
+
+
 class VLMInterface(ABC):
     @abstractmethod
     def build_vlm(
@@ -100,6 +139,52 @@ class VLMInterface(ABC):
     ) -> str:
         raise NotImplementedError
 
+    def answer_vqa_batch(
+        self,
+        prompt: PromptBatchInput,
+        *,
+        image_paths: Sequence[str],
+        batch_size: int | None = None,
+        **selector_kwargs: Any,
+    ) -> list[str]:
+        image_path_batch = _materialize_batch_sequence(
+            image_paths,
+            label="image_paths",
+        )
+        _normalize_max_batch_size(batch_size)
+        prompts = _expand_batch_prompts(prompt, batch_size=len(image_path_batch))
+        return [
+            self.answer_vqa(
+                item_prompt,
+                image_path=str(image_path),
+                **selector_kwargs,
+            )
+            for item_prompt, image_path in zip(prompts, image_path_batch)
+        ]
+
+    def answer_video_batch(
+        self,
+        prompt: PromptBatchInput,
+        *,
+        video_paths: Sequence[str],
+        batch_size: int | None = None,
+        **selector_kwargs: Any,
+    ) -> list[str]:
+        video_path_batch = _materialize_batch_sequence(
+            video_paths,
+            label="video_paths",
+        )
+        _normalize_max_batch_size(batch_size)
+        prompts = _expand_batch_prompts(prompt, batch_size=len(video_path_batch))
+        return [
+            self.answer_video(
+                item_prompt,
+                video_path=str(video_path),
+                **selector_kwargs,
+            )
+            for item_prompt, video_path in zip(prompts, video_path_batch)
+        ]
+
     def answer(
         self,
         prompt: PromptInput,
@@ -123,6 +208,33 @@ class VLMInterface(ABC):
                 **selector_kwargs,
             )
         raise ValueError("One of `image_path` or `video_path` must be provided.")
+
+    def answer_batch(
+        self,
+        prompt: PromptBatchInput,
+        *,
+        image_paths: Sequence[str] | None = None,
+        video_paths: Sequence[str] | None = None,
+        batch_size: int | None = None,
+        **selector_kwargs: Any,
+    ) -> list[str]:
+        if image_paths is not None and video_paths is not None:
+            raise ValueError("Provide only one of `image_paths` or `video_paths`.")
+        if image_paths is not None:
+            return self.answer_vqa_batch(
+                prompt,
+                image_paths=image_paths,
+                batch_size=batch_size,
+                **selector_kwargs,
+            )
+        if video_paths is not None:
+            return self.answer_video_batch(
+                prompt,
+                video_paths=video_paths,
+                batch_size=batch_size,
+                **selector_kwargs,
+            )
+        raise ValueError("One of `image_paths` or `video_paths` must be provided.")
 
 
 class BaseVLM(VLMInterface):
