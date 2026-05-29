@@ -249,6 +249,7 @@ class BaseVLM(VLMInterface):
         processor_kwargs: dict[str, Any] | None = None,
         model_kwargs: dict[str, Any] | None = None,
         generation_kwargs: dict[str, Any] | None = None,
+        inference_batch_size: int | None = None,
         dtype: str | torch.dtype | None = None,
         quantization: dict[str, Any] | None = None,
         local_model_dir: str | None = None,
@@ -270,6 +271,7 @@ class BaseVLM(VLMInterface):
         self.processor_kwargs = dict(processor_kwargs or {})
         self.model_kwargs = dict(model_kwargs or {})
         self.generation_kwargs = dict(generation_kwargs or {})
+        self.inference_batch_size = _normalize_max_batch_size(inference_batch_size)
         self.dtype = DTYPE_MAP[dtype] if isinstance(dtype, str) else dtype
         self.quantization = dict(quantization or {})
         self.local_model_dir = (
@@ -651,6 +653,25 @@ class BaseVLM(VLMInterface):
         except StopIteration:
             return torch.device("cpu")
 
+    def _move_model_inputs_to_device(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        device = self._model_device()
+        return {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+
+    def _ensure_batch_padding_token(self) -> None:
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None or getattr(tokenizer, "pad_token_id", None) is not None:
+            return
+
+        for token_attr in ("eos_token", "unk_token"):
+            token = getattr(tokenizer, token_attr, None)
+            if token is not None:
+                tokenizer.pad_token = token
+                return
+        raise ValueError("Batch inference requires a tokenizer pad token.")
+
     def _build_model_inputs(
         self,
         prompt_text: str,
@@ -663,25 +684,71 @@ class BaseVLM(VLMInterface):
         if image is not None:
             processor_inputs["images"] = image
 
-        inputs = self.processor(**processor_inputs)
-        device = self._model_device()
-        return {
-            key: value.to(device) if hasattr(value, "to") else value
-            for key, value in inputs.items()
+        return self._move_model_inputs_to_device(self.processor(**processor_inputs))
+
+    def _build_batch_model_inputs(
+        self,
+        prompt_texts: Sequence[str],
+        images: Sequence[Image.Image] | None,
+    ) -> dict[str, Any]:
+        prompt_text_batch = _materialize_batch_sequence(
+            prompt_texts,
+            label="prompt_texts",
+        )
+        image_batch = None
+        if images is not None:
+            image_batch = _materialize_batch_sequence(images, label="images")
+            if len(image_batch) != len(prompt_text_batch):
+                raise ValueError(
+                    "`images` batch length must match `prompt_texts`: "
+                    f"images={len(image_batch)}, prompt_texts={len(prompt_text_batch)}."
+                )
+
+        self._ensure_batch_padding_token()
+        processor_inputs: dict[str, Any] = {
+            "text": prompt_text_batch,
+            "return_tensors": "pt",
+            "padding": True,
         }
+        if image_batch is not None:
+            processor_inputs["images"] = image_batch
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        original_padding_side = getattr(tokenizer, "padding_side", None)
+        if original_padding_side is not None:
+            tokenizer.padding_side = "left"
+        try:
+            inputs = self.processor(**processor_inputs)
+        finally:
+            if original_padding_side is not None:
+                tokenizer.padding_side = original_padding_side
+        return self._move_model_inputs_to_device(inputs)
+
+    def _decode_generation_outputs(
+        self,
+        output_ids: torch.Tensor,
+        prompt_length: int,
+    ) -> list[str]:
+        if output_ids.ndim == 2 and output_ids.shape[1] >= prompt_length:
+            output_ids = output_ids[:, prompt_length:]
+        return [
+            output.strip()
+            for output in self.processor.batch_decode(
+                output_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            )
+        ]
 
     def _decode_generation_output(
         self,
         output_ids: torch.Tensor,
         prompt_length: int,
     ) -> str:
-        if output_ids.ndim == 2 and output_ids.shape[1] >= prompt_length:
-            output_ids = output_ids[:, prompt_length:]
-        return self.processor.batch_decode(
+        return self._decode_generation_outputs(
             output_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )[0].strip()
+            prompt_length=prompt_length,
+        )[0]
 
     def _count_generated_tokens(
         self,
@@ -690,9 +757,22 @@ class BaseVLM(VLMInterface):
     ) -> int:
         if output_ids.ndim != 2:
             return 0
-        return max(int(output_ids.shape[1]) - int(prompt_length), 0)
+        generated_per_sequence = max(int(output_ids.shape[1]) - int(prompt_length), 0)
+        return generated_per_sequence * int(output_ids.shape[0])
 
     def _run_standard_generation(self, model_inputs: dict[str, Any]) -> str:
+        outputs = self._run_standard_generation_batch(
+            model_inputs,
+            timing_path="standard_generation",
+        )
+        return outputs[0]
+
+    def _run_standard_generation_batch(
+        self,
+        model_inputs: dict[str, Any],
+        *,
+        timing_path: str = "standard_generation_batch",
+    ) -> list[str]:
         generate_start = time.perf_counter()
         with torch.inference_mode():
             output_ids = self.model.generate(
@@ -707,12 +787,15 @@ class BaseVLM(VLMInterface):
             output_ids,
             prompt_length=prompt_length,
         )
+        batch_size = int(output_ids.shape[0]) if output_ids.ndim > 0 else 1
         self.last_timing_info = {
-            "path": "standard_generation",
+            "path": timing_path,
+            "batch_size": batch_size,
+            "input_sequence_length": int(prompt_length),
             "llm_generate_seconds": generate_elapsed,
             "generated_tokens": generated_tokens,
         }
-        return self._decode_generation_output(output_ids, prompt_length=prompt_length)
+        return self._decode_generation_outputs(output_ids, prompt_length=prompt_length)
 
     def _call_with_supported_kwargs(
         self,
@@ -1107,6 +1190,174 @@ class BaseVLM(VLMInterface):
         }
         return self._run_standard_generation(model_inputs)
 
+    def _answer_visual_batch_chunk(
+        self,
+        prompts: Sequence[PromptInput],
+        *,
+        images: Sequence[Image.Image],
+    ) -> list[str]:
+        prompt_texts = [
+            self._prepare_text_input(prompt, has_image=True)
+            for prompt in prompts
+        ]
+        model_inputs = self._build_batch_model_inputs(
+            prompt_texts=prompt_texts,
+            images=images,
+        )
+        return self._run_standard_generation_batch(model_inputs)
+
+    def _answer_visual_batch_serial(
+        self,
+        prompts: Sequence[PromptInput],
+        *,
+        images: Sequence[Image.Image],
+        visual_metadata: Sequence[dict[str, Any]],
+    ) -> list[str]:
+        outputs: list[str] = []
+        item_timing_info: list[dict[str, Any]] = []
+        item_patch_info: list[dict[str, Any]] = []
+        total_generate_seconds = 0.0
+        total_generated_tokens = 0
+
+        for prompt, image, metadata in zip(prompts, images, visual_metadata):
+            outputs.append(
+                self._answer_with_visual(
+                    prompt,
+                    image=image,
+                    visual_metadata=metadata,
+                )
+            )
+            timing_info = dict(self.last_timing_info)
+            patch_info = dict(self.last_patch_selection_info)
+            item_timing_info.append(timing_info)
+            item_patch_info.append(patch_info)
+            total_generate_seconds += float(timing_info.get("llm_generate_seconds") or 0.0)
+            total_generated_tokens += int(timing_info.get("generated_tokens") or 0)
+
+        self.last_timing_info = {
+            "path": "serial_batch_generation",
+            "batch_size": len(outputs),
+            "llm_generate_seconds": total_generate_seconds,
+            "generated_tokens": total_generated_tokens,
+            "items": item_timing_info,
+        }
+        self.last_patch_selection_info = {
+            "applied": any(bool(item.get("applied", False)) for item in item_patch_info),
+            "backend": self.backend,
+            "reason": "patch_selector_requires_single_sample",
+            "batch_size": len(outputs),
+            "items": item_patch_info,
+        }
+        return outputs
+
+    def _answer_batch_with_visual(
+        self,
+        prompts: Sequence[PromptInput],
+        *,
+        images: Sequence[Image.Image],
+        visual_metadata: Sequence[dict[str, Any]],
+        batch_size: int | None = None,
+    ) -> list[str]:
+        prompt_batch = list(prompts)
+        image_batch = list(images)
+        metadata_batch = list(visual_metadata)
+        if len(prompt_batch) != len(image_batch):
+            raise ValueError(
+                "`prompts` batch length must match `images`: "
+                f"prompts={len(prompt_batch)}, images={len(image_batch)}."
+            )
+        if len(metadata_batch) != len(image_batch):
+            raise ValueError(
+                "`visual_metadata` batch length must match `images`: "
+                f"visual_metadata={len(metadata_batch)}, images={len(image_batch)}."
+            )
+
+        visual_items = [
+            {key: value for key, value in metadata.items() if not key.startswith("_")}
+            for metadata in metadata_batch
+        ]
+        self.last_visual_selection_info = {
+            "batch_size": len(image_batch),
+            "items": visual_items,
+        }
+        if not image_batch:
+            self.last_timing_info = {
+                "path": "standard_generation_batch",
+                "batch_size": 0,
+                "llm_generate_seconds": 0.0,
+                "generated_tokens": 0,
+            }
+            self.last_patch_selection_info = {
+                "applied": False,
+                "backend": self.backend,
+                "reason": "empty_batch",
+                "batch_size": 0,
+            }
+            return []
+
+        if self.patch_selector is not None:
+            outputs = self._answer_visual_batch_serial(
+                prompt_batch,
+                images=image_batch,
+                visual_metadata=metadata_batch,
+            )
+            self.last_visual_selection_info = {
+                "batch_size": len(image_batch),
+                "items": visual_items,
+            }
+            return outputs
+
+        max_batch_size = (
+            _normalize_max_batch_size(batch_size)
+            if batch_size is not None
+            else self.inference_batch_size
+        )
+        if max_batch_size is None:
+            max_batch_size = len(image_batch)
+
+        outputs: list[str] = []
+        total_generate_seconds = 0.0
+        total_generated_tokens = 0
+        input_sequence_length = 0
+        num_batches = 0
+        for start in range(0, len(image_batch), max_batch_size):
+            end = start + max_batch_size
+            outputs.extend(
+                self._answer_visual_batch_chunk(
+                    prompt_batch[start:end],
+                    images=image_batch[start:end],
+                )
+            )
+            timing_info = self.last_timing_info
+            total_generate_seconds += float(timing_info.get("llm_generate_seconds") or 0.0)
+            total_generated_tokens += int(timing_info.get("generated_tokens") or 0)
+            input_sequence_length = max(
+                input_sequence_length,
+                int(timing_info.get("input_sequence_length") or 0),
+            )
+            num_batches += 1
+
+        self.last_visual_selection_info = {
+            "batch_size": len(image_batch),
+            "items": visual_items,
+        }
+        self.last_patch_selection_info = {
+            "applied": False,
+            "backend": self.backend,
+            "reason": "patch_selector_not_configured",
+            "batch_size": len(image_batch),
+        }
+        self.last_timing_info = {
+            "path": "standard_generation_batch",
+            "batch_size": len(image_batch),
+            "num_batches": num_batches,
+            "max_batch_size": max_batch_size,
+            "input_sequence_length": input_sequence_length,
+            "llm_generate_seconds": total_generate_seconds,
+            "generated_tokens": total_generated_tokens,
+        }
+        return outputs
+
     def answer_vqa(
         self,
         prompt: PromptInput,
@@ -1137,6 +1388,62 @@ class BaseVLM(VLMInterface):
             prompt,
             image=image,
             visual_metadata=visual_metadata,
+        )
+
+    def answer_vqa_batch(
+        self,
+        prompt: PromptBatchInput,
+        *,
+        image_paths: Sequence[str],
+        batch_size: int | None = None,
+        **selector_kwargs: Any,
+    ) -> list[str]:
+        del selector_kwargs
+        image_path_batch = _materialize_batch_sequence(
+            image_paths,
+            label="image_paths",
+        )
+        prompts = _expand_batch_prompts(prompt, batch_size=len(image_path_batch))
+        images: list[Image.Image] = []
+        visual_metadata: list[dict[str, Any]] = []
+        for image_path in image_path_batch:
+            image, metadata = self._load_vqa_input(image_path=str(image_path))
+            images.append(image)
+            visual_metadata.append(metadata)
+        return self._answer_batch_with_visual(
+            prompts,
+            images=images,
+            visual_metadata=visual_metadata,
+            batch_size=batch_size,
+        )
+
+    def answer_video_batch(
+        self,
+        prompt: PromptBatchInput,
+        *,
+        video_paths: Sequence[str],
+        batch_size: int | None = None,
+        **selector_kwargs: Any,
+    ) -> list[str]:
+        video_path_batch = _materialize_batch_sequence(
+            video_paths,
+            label="video_paths",
+        )
+        prompts = _expand_batch_prompts(prompt, batch_size=len(video_path_batch))
+        images: list[Image.Image] = []
+        visual_metadata: list[dict[str, Any]] = []
+        for video_path in video_path_batch:
+            image, metadata = self._load_video_input(
+                video_path=str(video_path),
+                selector_kwargs=selector_kwargs,
+            )
+            images.append(image)
+            visual_metadata.append(metadata)
+        return self._answer_batch_with_visual(
+            prompts,
+            images=images,
+            visual_metadata=visual_metadata,
+            batch_size=batch_size,
         )
 
     def answer(

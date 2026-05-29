@@ -15,7 +15,7 @@ frame_selection:
   _target_: model.video.uniform_sampling
   _partial_: true
   num_frames: 10
-  max_side: 720
+  max_side: 480
 
 vlm:
   _target_: model.vlm.BaseVLM
@@ -23,7 +23,7 @@ vlm:
   backend: "llava"
   dtype: "bf16"
   quantization:
-    enabled: false
+    enabled: true
     mode: "4bit"
     skip_vision_encoder: true
     skip_modules: []
@@ -40,15 +40,18 @@ vlm:
   processor_kwargs: {}
   model_kwargs: {}
   local_model_dir: "./model/repo"
+  # Max VLM generation batch size used by answer_*_batch when no explicit
+  # batch_size is provided. null means process the whole requested batch at once.
+  inference_batch_size: 10
   generation_kwargs:
     do_sample: false
-    max_new_tokens: 128
+    max_new_tokens: 256
 
 invoke:
   task: "auto"
-  image_path: null
+  image_path: "./data/image.png"
   video_path: null
   prompt_file: "model/prompt.txt"
   query_file: "model/query.txt"
   print_config: false
-  quiet_model_loading: true
+  quiet_model_loading: false

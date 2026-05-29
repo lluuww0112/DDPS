@@ -46,9 +46,21 @@ def extract_runtime_metrics(vlm: Any) -> dict[str, int | bool | None]:
     selected_video_tokens = _coerce_int(
         patch_info.get("selected_video_tokens")
     )
+    if selected_video_tokens is None:
+        selected_video_tokens = _coerce_int(
+            patch_info.get("selected_image_tokens")
+        )
     original_video_tokens = _coerce_int(
         patch_info.get("original_video_tokens")
     )
+    if original_video_tokens is None:
+        original_video_tokens = _coerce_int(
+            patch_info.get("original_image_tokens")
+        )
+    if original_video_tokens is None:
+        original_video_tokens = _coerce_int(
+            patch_info.get("image_token_count")
+        )
     reallocated_patch_count = _coerce_int(
         patch_info.get("reallocated_token_count")
     )

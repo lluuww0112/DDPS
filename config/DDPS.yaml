@@ -51,7 +51,7 @@ vlm:
   backend: "llava"
   dtype: "bf16"
   quantization:
-    enabled: false
+    enabled: true
     mode: "4bit"
     skip_vision_encoder: true
     skip_modules: []
@@ -68,6 +68,9 @@ vlm:
   processor_kwargs: {}
   model_kwargs: {}
   local_model_dir: "./model/repo"
+  # Max VLM generation batch size used by answer_*_batch when no explicit
+  # batch_size is provided. null means process the whole requested batch at once.
+  inference_batch_size: 10
   generation_kwargs:
     do_sample: false
     max_new_tokens: 128

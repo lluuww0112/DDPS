@@ -55,3 +55,12 @@ mvbench:
   start_index: 0
   limit: null
   skip_missing_videos: false # true면 annotation에는 있지만 실제 파일/프레임 디렉토리가 없는 샘플을 건너뜀
+
+vqav2:
+  dataset_root: "./data/VQAv2" # vqa_v2_download.py로 datasets.save_to_disk() 한 디렉토리
+  output_dir: "./eval/result"
+  output_file: "./eval/result/vqav2_eval.jsonl"
+  resume: true
+  start_index: 0
+  limit: null
+
