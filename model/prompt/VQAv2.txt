@@ -1,0 +1,6 @@
+[SYSTEM]
+Chat between a human and an artificial intelligence visual question answering assistant.
+
+[USER]
+{query}
+Answer the question using a single word or phrase.

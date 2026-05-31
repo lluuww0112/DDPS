@@ -528,6 +528,16 @@ class BaseVLM(VLMInterface):
             raise ValueError("Prompt must include a non-empty user prompt.")
         return system_prompt, user_prompt
 
+    def _selector_query_from_prompt(self, prompt: PromptInput) -> str:
+        if isinstance(prompt, Mapping):
+            for key in ("query", "question", "user"):
+                value = prompt.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+            return ""
+
+        return str(prompt).strip()
+
     def _build_chat_messages(
         self,
         *,
@@ -814,13 +824,83 @@ class BaseVLM(VLMInterface):
         }
         return fn(**filtered_kwargs)
 
-    def _extract_image_features(
+    def _coerce_image_features(self, image_features: Any) -> torch.Tensor:
+        pooler_output = getattr(image_features, "pooler_output", None)
+        if pooler_output is not None:
+            image_features = pooler_output
+
+        if isinstance(image_features, (list, tuple)):
+            if len(image_features) != 1:
+                raise ValueError("Patch selection currently expects a single image.")
+            image_features = image_features[0]
+
+        if not isinstance(image_features, torch.Tensor):
+            raise TypeError(
+                "Expected image features to resolve to a tensor, "
+                f"but got {type(image_features).__name__}."
+            )
+
+        if image_features.ndim == 3:
+            if image_features.shape[0] != 1:
+                raise ValueError("Patch selection currently expects a single image.")
+            image_features = image_features[0]
+        if image_features.ndim != 2:
+            raise ValueError(
+                "Expected image features with shape (N, D), "
+                f"but got {tuple(image_features.shape)}."
+            )
+        return image_features
+
+    def _coerce_batch_image_features(
+        self,
+        image_features: Any,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor:
+        pooler_output = getattr(image_features, "pooler_output", None)
+        if pooler_output is not None:
+            image_features = pooler_output
+
+        if isinstance(image_features, (list, tuple)):
+            if len(image_features) == batch_size and all(
+                isinstance(item, torch.Tensor) for item in image_features
+            ):
+                image_features = torch.stack(list(image_features), dim=0)
+            elif len(image_features) == 1:
+                image_features = image_features[0]
+            else:
+                raise ValueError(
+                    "Batch image features must contain one tensor or one tensor per image."
+                )
+
+        if not isinstance(image_features, torch.Tensor):
+            raise TypeError(
+                "Expected image features to resolve to a tensor, "
+                f"but got {type(image_features).__name__}."
+            )
+
+        if image_features.ndim == 2 and batch_size == 1:
+            image_features = image_features.unsqueeze(0)
+        if image_features.ndim != 3:
+            raise ValueError(
+                "Expected batched image features with shape (B, N, D), "
+                f"but got {tuple(image_features.shape)}."
+            )
+        if int(image_features.shape[0]) != int(batch_size):
+            raise ValueError(
+                "Image feature batch size does not match inputs: "
+                f"features={int(image_features.shape[0])}, inputs={batch_size}."
+            )
+        return image_features
+
+    def _extract_batch_image_features(
         self,
         model_inputs: dict[str, Any],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         pixel_values = model_inputs.get("pixel_values")
         if pixel_values is None:
             raise ValueError("Image inputs are required for patch selection.")
+        batch_size = int(pixel_values.shape[0])
 
         get_image_features = getattr(self.model, "get_image_features", None)
         if callable(get_image_features):
@@ -858,20 +938,18 @@ class BaseVLM(VLMInterface):
                 selected_features = selected_features[:, 1:]
             image_features = projector(selected_features)
 
-        if isinstance(image_features, (list, tuple)):
-            if len(image_features) != 1:
-                raise ValueError("Patch selection currently expects a single image.")
-            image_features = image_features[0]
-        if image_features.ndim == 3:
-            if image_features.shape[0] != 1:
-                raise ValueError("Patch selection currently expects a single image.")
-            image_features = image_features[0]
-        if image_features.ndim != 2:
-            raise ValueError(
-                "Expected image features with shape (N, D), "
-                f"but got {tuple(image_features.shape)}."
-            )
-        return image_features, {"image_token_count": int(image_features.shape[0])}
+        image_features = self._coerce_batch_image_features(
+            image_features,
+            batch_size=batch_size,
+        )
+        return image_features, {"image_token_count": int(image_features.shape[1])}
+
+    def _extract_image_features(
+        self,
+        model_inputs: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        image_features, metadata = self._extract_batch_image_features(model_inputs)
+        return image_features[0], metadata
 
     def _call_patch_selector(
         self,
@@ -894,11 +972,59 @@ class BaseVLM(VLMInterface):
             "extraction_metadata": extraction_metadata,
             "visual_metadata": visual_metadata,
             "frame_selection": visual_metadata.get("_frame_selection"),
+            "query": self._selector_query_from_prompt(prompt),
             "processor": self.processor,
             "model": self.model,
             "backend": self.backend,
         }
         return self._call_with_supported_kwargs(self.patch_selector, selector_kwargs)
+
+    def _resolve_batch_patch_selector(self) -> tuple[Callable[..., Any], dict[str, Any]] | None:
+        if self.patch_selector is None:
+            return None
+
+        selector = self.patch_selector
+        selector_kwargs: dict[str, Any] = {}
+        if isinstance(selector, functools.partial):
+            selector_kwargs = dict(selector.keywords or {})
+            selector = selector.func
+
+        batch_selector = getattr(self.patch_selector, "batch", None)
+        if batch_selector is None:
+            batch_selector = getattr(selector, "batch", None)
+        if batch_selector is None or not callable(batch_selector):
+            return None
+        return batch_selector, selector_kwargs
+
+    def _call_patch_selector_batch(
+        self,
+        image_features: torch.Tensor,
+        *,
+        prompts: Sequence[PromptInput],
+        images: Sequence[Image.Image],
+        model_inputs: dict[str, Any],
+        extraction_metadata: dict[str, Any],
+        visual_metadata: Sequence[dict[str, Any]],
+    ) -> Any:
+        batch_target = self._resolve_batch_patch_selector()
+        if batch_target is None:
+            return None
+
+        batch_selector, selector_kwargs = batch_target
+        selector_inputs = {
+            **selector_kwargs,
+            "image_features": image_features,
+            "prompts": list(prompts),
+            "queries": [self._selector_query_from_prompt(prompt) for prompt in prompts],
+            "images": list(images),
+            "model_inputs": model_inputs,
+            "extraction_metadata": extraction_metadata,
+            "visual_metadata": list(visual_metadata),
+            "processor": self.processor,
+            "model": self.model,
+            "backend": self.backend,
+        }
+        return self._call_with_supported_kwargs(batch_selector, selector_inputs)
 
     def _coerce_patch_indices(
         self,
@@ -1083,6 +1209,141 @@ class BaseVLM(VLMInterface):
         }
         return generation_inputs, metadata
 
+    def _build_batch_generation_inputs_from_patch_selection(
+        self,
+        model_inputs: dict[str, Any],
+        full_image_features: torch.Tensor,
+        selected_indices_batch: Sequence[torch.Tensor],
+        selected_features_batch: Sequence[torch.Tensor],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        input_ids = model_inputs.get("input_ids")
+        attention_mask = model_inputs.get("attention_mask")
+        if input_ids is None:
+            raise ValueError("`input_ids` is required for patch selection.")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        batch_size = int(input_ids.shape[0])
+        if len(selected_indices_batch) != batch_size or len(selected_features_batch) != batch_size:
+            raise ValueError("Patch selection batch length must match model input batch size.")
+
+        image_token_id = getattr(self.model.config, "image_token_index", None)
+        if image_token_id is None:
+            image_token_id = getattr(self.model.config, "image_token_id", None)
+        if image_token_id is None:
+            raise ValueError("Could not find the image placeholder token id.")
+
+        embedding_layer = self.model.get_input_embeddings()
+        pad_token_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        pruned_input_ids: list[torch.Tensor] = []
+        pruned_attention_masks: list[torch.Tensor] = []
+        pruned_input_embeds: list[torch.Tensor] = []
+        item_metadata: list[dict[str, Any]] = []
+
+        for item_index in range(batch_size):
+            item_input_ids = input_ids[item_index]
+            item_attention_mask = attention_mask[item_index]
+            item_full_features = full_image_features[item_index]
+            selected_indices = selected_indices_batch[item_index]
+            selected_features = selected_features_batch[item_index]
+
+            image_positions = torch.nonzero(
+                item_input_ids == int(image_token_id),
+                as_tuple=False,
+            ).flatten()
+            if int(image_positions.numel()) != int(item_full_features.shape[0]):
+                return None, {
+                    "reason": "image_placeholder_feature_mismatch",
+                    "batch_index": item_index,
+                    "image_placeholders": int(image_positions.numel()),
+                    "image_features": int(item_full_features.shape[0]),
+                }
+
+            kept_positions = image_positions[selected_indices]
+            keep_mask = torch.ones(
+                item_input_ids.shape[0],
+                dtype=torch.bool,
+                device=item_input_ids.device,
+            )
+            keep_mask[image_positions] = False
+            keep_mask[kept_positions] = True
+
+            item_pruned_input_ids = item_input_ids[keep_mask]
+            item_pruned_attention_mask = item_attention_mask[keep_mask]
+            item_pruned_embeds = embedding_layer(item_pruned_input_ids.unsqueeze(0))[0]
+
+            pruned_image_mask = item_pruned_input_ids == int(image_token_id)
+            item_pruned_features = selected_features.to(
+                device=item_pruned_embeds.device,
+                dtype=item_pruned_embeds.dtype,
+            )
+            if int(pruned_image_mask.sum().item()) != int(item_pruned_features.shape[0]):
+                raise ValueError(
+                    "Pruned image placeholder count does not match selected feature count: "
+                    f"tokens={int(pruned_image_mask.sum().item())}, "
+                    f"features={int(item_pruned_features.shape[0])}."
+                )
+
+            item_pruned_embeds[pruned_image_mask] = item_pruned_features
+            pruned_input_ids.append(item_pruned_input_ids)
+            pruned_attention_masks.append(item_pruned_attention_mask)
+            pruned_input_embeds.append(item_pruned_embeds)
+            item_metadata.append(
+                {
+                    "original_image_tokens": int(item_full_features.shape[0]),
+                    "selected_image_tokens": int(item_pruned_features.shape[0]),
+                    "input_length_before": int(item_input_ids.shape[0]),
+                    "input_length_after": int(item_pruned_input_ids.shape[0]),
+                }
+            )
+
+        max_length = max(int(item.shape[0]) for item in pruned_input_ids)
+        embed_dim = int(pruned_input_embeds[0].shape[-1])
+        batched_input_ids = torch.full(
+            (batch_size, max_length),
+            int(pad_token_id),
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        batched_attention_mask = torch.zeros(
+            (batch_size, max_length),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        batched_inputs_embeds = torch.zeros(
+            (batch_size, max_length, embed_dim),
+            dtype=pruned_input_embeds[0].dtype,
+            device=pruned_input_embeds[0].device,
+        )
+
+        for item_index, (item_ids, item_mask, item_embeds) in enumerate(
+            zip(pruned_input_ids, pruned_attention_masks, pruned_input_embeds)
+        ):
+            item_length = int(item_ids.shape[0])
+            start = max_length - item_length
+            batched_input_ids[item_index, start:] = item_ids
+            batched_attention_mask[item_index, start:] = item_mask
+            batched_inputs_embeds[item_index, start:] = item_embeds
+
+        position_ids = batched_attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(batched_attention_mask == 0, 0)
+        generation_inputs = {
+            "input_ids": batched_input_ids,
+            "inputs_embeds": batched_inputs_embeds,
+            "attention_mask": batched_attention_mask,
+            "position_ids": position_ids,
+        }
+        metadata = {
+            "batch_size": batch_size,
+            "input_length_before": int(input_ids.shape[1]),
+            "input_length_after": max_length,
+            "items": item_metadata,
+        }
+        return generation_inputs, metadata
+
     @torch.inference_mode()
     def _run_patch_selection_generation(
         self,
@@ -1160,6 +1421,139 @@ class BaseVLM(VLMInterface):
             "generated_tokens": generated_tokens,
         }
         return self._decode_generation_output(output_ids, prompt_length=prompt_length)
+
+    @torch.inference_mode()
+    def _run_patch_selection_generation_batch(
+        self,
+        prompts: Sequence[PromptInput],
+        *,
+        images: Sequence[Image.Image],
+        model_inputs: dict[str, Any],
+        visual_metadata: Sequence[dict[str, Any]],
+    ) -> list[str] | None:
+        full_image_features_batch, extraction_metadata = self._extract_batch_image_features(
+            model_inputs
+        )
+
+        selected_indices_batch: list[torch.Tensor] = []
+        selected_features_batch: list[torch.Tensor] = []
+        item_patch_info: list[dict[str, Any]] = []
+        selector_runtime_metadata: dict[str, Any] = {}
+        selection_outputs = self._call_patch_selector_batch(
+            full_image_features_batch,
+            prompts=prompts,
+            images=images,
+            model_inputs=model_inputs,
+            extraction_metadata=extraction_metadata,
+            visual_metadata=visual_metadata,
+        )
+        if selection_outputs is not None:
+            selection_outputs = list(selection_outputs)
+            if len(selection_outputs) != len(prompts):
+                raise ValueError(
+                    "Batch patch selector output length must match prompts: "
+                    f"outputs={len(selection_outputs)}, prompts={len(prompts)}."
+                )
+
+        for item_index, (prompt, image, metadata) in enumerate(
+            zip(prompts, images, visual_metadata)
+        ):
+            full_image_features = full_image_features_batch[item_index]
+            item_extraction_metadata = {
+                key: value
+                for key, value in extraction_metadata.items()
+                if key != "batch_size"
+            }
+            if selection_outputs is None:
+                selection_output = self._call_patch_selector(
+                    image_features=full_image_features,
+                    prompt=prompt,
+                    image=image,
+                    model_inputs=model_inputs,
+                    extraction_metadata=item_extraction_metadata,
+                    visual_metadata=metadata,
+                )
+            else:
+                selection_output = selection_outputs[item_index]
+            selected_indices, selected_features, selector_metadata = (
+                self._normalize_patch_selection_output(
+                    selection_output=selection_output,
+                    full_image_features=full_image_features,
+                )
+            )
+            selected_indices_batch.append(selected_indices)
+            selected_features_batch.append(selected_features)
+            selector_runtime_metadata = {
+                key: selector_metadata[key]
+                for key in (
+                    "original_video_tokens",
+                    "selected_video_tokens",
+                    "reallocated_token_count",
+                )
+                if key in selector_metadata
+            }
+            item_patch_info.append(
+                {
+                    "applied": True,
+                    "backend": self.backend,
+                    **item_extraction_metadata,
+                    **selector_runtime_metadata,
+                    "selector_metadata": selector_metadata,
+                    "selector_output_keys": sorted(selector_metadata.keys()),
+                }
+            )
+
+        generation_inputs, pruning_metadata = (
+            self._build_batch_generation_inputs_from_patch_selection(
+                model_inputs=model_inputs,
+                full_image_features=full_image_features_batch,
+                selected_indices_batch=selected_indices_batch,
+                selected_features_batch=selected_features_batch,
+            )
+        )
+        if generation_inputs is None:
+            self.last_patch_selection_info = {
+                "applied": False,
+                "backend": self.backend,
+                **extraction_metadata,
+                "items": item_patch_info,
+                **pruning_metadata,
+            }
+            return None
+
+        pruning_items = pruning_metadata.get("items")
+        if isinstance(pruning_items, list):
+            for item_info, item_pruning in zip(item_patch_info, pruning_items):
+                item_info.update(item_pruning)
+
+        generate_start = time.perf_counter()
+        output_ids = self.model.generate(
+            **generation_inputs,
+            **self.generation_kwargs,
+        )
+        generate_elapsed = time.perf_counter() - generate_start
+
+        prompt_length = generation_inputs["input_ids"].shape[1]
+        generated_tokens = self._count_generated_tokens(
+            output_ids,
+            prompt_length=prompt_length,
+        )
+        batch_size = int(output_ids.shape[0]) if output_ids.ndim > 0 else len(prompts)
+        self.last_patch_selection_info = {
+            "applied": True,
+            "backend": self.backend,
+            **extraction_metadata,
+            **{key: value for key, value in pruning_metadata.items() if key != "items"},
+            "items": item_patch_info,
+        }
+        self.last_timing_info = {
+            "path": "patch_selection_generation_batch",
+            "batch_size": batch_size,
+            "input_sequence_length": int(prompt_length),
+            "llm_generate_seconds": generate_elapsed,
+            "generated_tokens": generated_tokens,
+        }
+        return self._decode_generation_outputs(output_ids, prompt_length=prompt_length)
 
     def _answer_with_visual(
         self,
@@ -1296,14 +1690,92 @@ class BaseVLM(VLMInterface):
             return []
 
         if self.patch_selector is not None:
-            outputs = self._answer_visual_batch_serial(
-                prompt_batch,
-                images=image_batch,
-                visual_metadata=metadata_batch,
+            max_batch_size = (
+                _normalize_max_batch_size(batch_size)
+                if batch_size is not None
+                else self.inference_batch_size
             )
+            if max_batch_size is None:
+                max_batch_size = len(image_batch)
+
+            outputs: list[str] = []
+            item_patch_info: list[dict[str, Any]] = []
+            total_generate_seconds = 0.0
+            total_generated_tokens = 0
+            input_sequence_length = 0
+            num_batches = 0
+            used_serial_fallback = False
+
+            for start in range(0, len(image_batch), max_batch_size):
+                end = start + max_batch_size
+                chunk_prompts = prompt_batch[start:end]
+                chunk_images = image_batch[start:end]
+                chunk_metadata = metadata_batch[start:end]
+                prompt_texts = [
+                    self._prepare_text_input(prompt, has_image=True)
+                    for prompt in chunk_prompts
+                ]
+                model_inputs = self._build_batch_model_inputs(
+                    prompt_texts=prompt_texts,
+                    images=chunk_images,
+                )
+                chunk_outputs = self._run_patch_selection_generation_batch(
+                    chunk_prompts,
+                    images=chunk_images,
+                    model_inputs=model_inputs,
+                    visual_metadata=chunk_metadata,
+                )
+                if chunk_outputs is None:
+                    used_serial_fallback = True
+                    chunk_outputs = self._answer_visual_batch_serial(
+                        chunk_prompts,
+                        images=chunk_images,
+                        visual_metadata=chunk_metadata,
+                    )
+
+                outputs.extend(chunk_outputs)
+                timing_info = dict(self.last_timing_info)
+                patch_info = dict(self.last_patch_selection_info)
+                patch_items = patch_info.get("items")
+                if isinstance(patch_items, list):
+                    item_patch_info.extend(
+                        item for item in patch_items if isinstance(item, dict)
+                    )
+                else:
+                    item_patch_info.append(patch_info)
+                total_generate_seconds += float(timing_info.get("llm_generate_seconds") or 0.0)
+                total_generated_tokens += int(timing_info.get("generated_tokens") or 0)
+                input_sequence_length = max(
+                    input_sequence_length,
+                    int(timing_info.get("input_sequence_length") or 0),
+                )
+                num_batches += 1
+
             self.last_visual_selection_info = {
                 "batch_size": len(image_batch),
                 "items": visual_items,
+            }
+            self.last_patch_selection_info = {
+                "applied": any(bool(item.get("applied", False)) for item in item_patch_info),
+                "backend": self.backend,
+                "reason": (
+                    "patch_selection_batch_with_serial_fallback"
+                    if used_serial_fallback
+                    else "patch_selection_batch"
+                ),
+                "batch_size": len(image_batch),
+                "num_batches": num_batches,
+                "max_batch_size": max_batch_size,
+                "items": item_patch_info,
+            }
+            self.last_timing_info = {
+                "path": "patch_selection_generation_batch",
+                "batch_size": len(image_batch),
+                "num_batches": num_batches,
+                "max_batch_size": max_batch_size,
+                "input_sequence_length": input_sequence_length,
+                "llm_generate_seconds": total_generate_seconds,
+                "generated_tokens": total_generated_tokens,
             }
             return outputs
 

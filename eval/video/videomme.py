@@ -696,7 +696,7 @@ def _collect_submission_stats(
     }
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="eval")
+@hydra.main(version_base=None, config_path="../../config", config_name="eval")
 def main(config: DictConfig) -> None:
     experiment_path = _resolve_experiment_config_path(config.get("experiment"))
     experiment_config = OmegaConf.load(experiment_path)

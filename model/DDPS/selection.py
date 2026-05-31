@@ -245,8 +245,8 @@ def preload_maskclip_patch_selection(
     )
 
 
-def _encode_text_query(
-    query: str,
+def _encode_text_queries(
+    queries: list[str],
     *,
     tokenizer: Any,
     text_model: CLIPTextModel,
@@ -254,14 +254,29 @@ def _encode_text_query(
 ) -> torch.Tensor:
     with torch.inference_mode():
         text_inputs = tokenizer(
-            query,
+            queries,
             padding=True,
             truncation=True,
             return_tensors="pt",
         )
         text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
         text_embedding = text_model(**text_inputs)
-        return F.normalize(text_embedding, dim=-1)[0]
+        return F.normalize(text_embedding, dim=-1)
+
+
+def _encode_text_query(
+    query: str,
+    *,
+    tokenizer: Any,
+    text_model: CLIPTextModel,
+    device: torch.device,
+) -> torch.Tensor:
+    return _encode_text_queries(
+        [query],
+        tokenizer=tokenizer,
+        text_model=text_model,
+        device=device,
+    )[0]
 
 
 @lru_cache(maxsize=16)
@@ -335,8 +350,33 @@ def _compute_dense_patch_score_maps_and_image_scores(
             patch_embeddings = F.normalize(patch_embeddings, dim=-1)
             image_latents = F.normalize(image_latents, dim=-1)
 
-            patch_scores = patch_embeddings @ text_embedding
-            image_scores = image_latents @ text_embedding
+            if text_embedding.ndim == 1:
+                patch_scores = patch_embeddings @ text_embedding
+                image_scores = image_latents @ text_embedding
+            elif text_embedding.ndim == 2:
+                batch_offset = start
+                batch_text_embedding = text_embedding[
+                    batch_offset : batch_offset + patch_embeddings.shape[0]
+                ]
+                if int(batch_text_embedding.shape[0]) != int(patch_embeddings.shape[0]):
+                    raise ValueError(
+                        "Text embedding batch length must match image batch length."
+                    )
+                patch_scores = torch.einsum(
+                    "bnd,bd->bn",
+                    patch_embeddings,
+                    batch_text_embedding,
+                )
+                image_scores = torch.einsum(
+                    "bd,bd->b",
+                    image_latents,
+                    batch_text_embedding,
+                )
+            else:
+                raise ValueError(
+                    "Text embedding must have shape (D,) or (B, D), "
+                    f"got {tuple(text_embedding.shape)}."
+                )
 
             clip_h = int(pixel_values.shape[-2] // patch_size)
             clip_w = int(pixel_values.shape[-1] // patch_size)
@@ -435,7 +475,8 @@ def maskclip_patch_selection(
     image_features: torch.Tensor,
     *,
     image: Image.Image,
-    query_file: str,
+    query_file: str | None = None,
+    query: str | None = None,
     keep_ratio: float = 0.5,
     clip_model_name: str = "openai/clip-vit-base-patch16",
     clip_dtype: str | torch.dtype | None = None,
@@ -455,7 +496,11 @@ def maskclip_patch_selection(
     selector_device = _resolve_device(device, image_features)
     selector_device_key = _resolve_device_key(selector_device)
     resolved_clip_dtype, clip_dtype_key = _resolve_clip_dtype(clip_dtype)
-    query = _load_query(query_file)
+    resolved_query = str(query).strip() if query is not None else ""
+    if not resolved_query:
+        if query_file is None:
+            raise ValueError("`query` or `query_file` must be provided for patch selection.")
+        resolved_query = _load_query(query_file)
     image_processor, _, vision_model, _ = _load_maskclip_components(
         clip_model_name,
         selector_device_key,
@@ -467,7 +512,7 @@ def maskclip_patch_selection(
         selector_device_key,
         clip_dtype_key,
         clip_do_center_crop,
-        query,
+        resolved_query,
     )
     dense_score_maps, image_scores, clip_grid = (
         _compute_dense_patch_score_maps_and_image_scores(
@@ -512,8 +557,8 @@ def maskclip_patch_selection(
         "clip_do_center_crop": (
             None if clip_do_center_crop is None else bool(clip_do_center_crop)
         ),
-        "query_file": str(Path(query_file).expanduser()),
-        "query": query,
+        "query_file": str(Path(query_file).expanduser()) if query_file is not None else None,
+        "query": resolved_query,
         "keep_ratio": float(keep_ratio),
         "keep_count": int(keep_count),
         "clip_grid_hw": [int(clip_grid[0]), int(clip_grid[1])],
@@ -530,4 +575,178 @@ def maskclip_patch_selection(
     )
 
 
+def _query_from_prompt_value(prompt: Any) -> str | None:
+    if isinstance(prompt, dict):
+        query = prompt.get("query")
+        if query is not None and str(query).strip():
+            return str(query).strip()
+        user_prompt = prompt.get("user")
+        if user_prompt is not None and str(user_prompt).strip():
+            return str(user_prompt).strip()
+    elif prompt is not None and str(prompt).strip():
+        return str(prompt).strip()
+    return None
+
+
+def _resolve_batch_queries(
+    *,
+    batch_size: int,
+    queries: list[str] | tuple[str, ...] | None = None,
+    prompts: list[Any] | tuple[Any, ...] | None = None,
+    query_file: str | None = None,
+) -> list[str]:
+    resolved_queries: list[str] = []
+    if queries is not None:
+        resolved_queries = [str(query).strip() for query in queries]
+    elif prompts is not None:
+        resolved_queries = [
+            _query_from_prompt_value(prompt) or ""
+            for prompt in prompts
+        ]
+    elif query_file is not None:
+        query = _load_query(query_file)
+        resolved_queries = [query] * batch_size
+
+    if len(resolved_queries) != batch_size or any(not query for query in resolved_queries):
+        raise ValueError(
+            "Batch patch selection requires one non-empty query per image."
+        )
+    return resolved_queries
+
+
+def maskclip_patch_selection_batch(
+    image_features: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    *,
+    images: list[Image.Image] | tuple[Image.Image, ...],
+    query_file: str | None = None,
+    queries: list[str] | tuple[str, ...] | None = None,
+    prompts: list[Any] | tuple[Any, ...] | None = None,
+    keep_ratio: float = 0.5,
+    clip_model_name: str = "openai/clip-vit-base-patch16",
+    clip_dtype: str | torch.dtype | None = None,
+    clip_do_center_crop: bool | None = None,
+    batch_size: int = 8,
+    image_grid_hw: tuple[int, int] | None = None,
+    device: str | torch.device | None = None,
+    **_: Any,
+) -> list[PatchSelectionResult]:
+    image_batch = list(images)
+    if torch.is_tensor(image_features):
+        if image_features.ndim == 2:
+            feature_batch = [image_features]
+        elif image_features.ndim == 3:
+            feature_batch = [image_features[index] for index in range(image_features.shape[0])]
+        else:
+            raise ValueError(
+                "Batched image features must have shape (B, N, D), "
+                f"got {tuple(image_features.shape)}."
+            )
+    else:
+        feature_batch = list(image_features)
+
+    if len(feature_batch) != len(image_batch):
+        raise ValueError(
+            "Image feature batch length must match images: "
+            f"features={len(feature_batch)}, images={len(image_batch)}."
+        )
+    if not image_batch:
+        return []
+
+    resolved_queries = _resolve_batch_queries(
+        batch_size=len(image_batch),
+        queries=queries,
+        prompts=prompts,
+        query_file=query_file,
+    )
+    selector_device = _resolve_device(device, feature_batch[0])
+    selector_device_key = _resolve_device_key(selector_device)
+    resolved_clip_dtype, clip_dtype_key = _resolve_clip_dtype(clip_dtype)
+    image_processor, tokenizer, vision_model, text_model = _load_maskclip_components(
+        clip_model_name,
+        selector_device_key,
+        clip_dtype_key,
+        clip_do_center_crop,
+    )
+    text_embeddings = _encode_text_queries(
+        resolved_queries,
+        tokenizer=tokenizer,
+        text_model=text_model,
+        device=selector_device,
+    )
+    dense_score_maps, image_scores, clip_grid = (
+        _compute_dense_patch_score_maps_and_image_scores(
+            image_batch,
+            image_processor=image_processor,
+            vision_model=vision_model,
+            text_embedding=text_embeddings,
+            batch_size=batch_size,
+            device=selector_device,
+            clip_dtype=resolved_clip_dtype,
+        )
+    )
+
+    results: list[PatchSelectionResult] = []
+    for item_index, (item_features, image, query) in enumerate(
+        zip(feature_batch, image_batch, resolved_queries)
+    ):
+        token_count = int(item_features.shape[0])
+        keep_count = _resolve_budget(token_count, keep_ratio=keep_ratio)
+        grid_h, grid_w = infer_feature_grid(
+            token_count,
+            image=image,
+            grid_hw=image_grid_hw,
+        )
+        score_map = _resize_score_maps(
+            dense_score_maps[item_index : item_index + 1],
+            target_height=grid_h,
+            target_width=grid_w,
+        )[0]
+        flat_scores = score_map.flatten()
+        if keep_count >= token_count:
+            selected_indices = torch.arange(
+                token_count,
+                device=flat_scores.device,
+                dtype=torch.long,
+            )
+        else:
+            selected_indices = torch.topk(
+                flat_scores,
+                k=keep_count,
+                largest=True,
+                sorted=False,
+            ).indices.sort().values
+        selected_indices = selected_indices.to(
+            device=item_features.device,
+            dtype=torch.long,
+        )
+        metadata = {
+            "selector_type": "maskclip_patch_selection_vqa",
+            "selection_mode": "batch_image_topk",
+            "clip_model_name": clip_model_name,
+            "clip_dtype": clip_dtype_key,
+            "clip_do_center_crop": (
+                None if clip_do_center_crop is None else bool(clip_do_center_crop)
+            ),
+            "query_file": str(Path(query_file).expanduser()) if query_file is not None else None,
+            "query": query,
+            "keep_ratio": float(keep_ratio),
+            "keep_count": int(keep_count),
+            "clip_grid_hw": [int(clip_grid[0]), int(clip_grid[1])],
+            "image_grid_hw": [grid_h, grid_w],
+            "score_min": float(flat_scores.min().item()),
+            "score_max": float(flat_scores.max().item()),
+            "image_importance_score": float(image_scores[item_index].item()),
+            "selected_token_count": int(selected_indices.numel()),
+            "image_token_count": token_count,
+        }
+        results.append(
+            PatchSelectionResult(
+                selected_indices=selected_indices,
+                metadata=metadata,
+            )
+        )
+    return results
+
+
 maskclip_patch_selection.preload = preload_maskclip_patch_selection
+maskclip_patch_selection.batch = maskclip_patch_selection_batch

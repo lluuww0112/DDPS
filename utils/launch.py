@@ -80,18 +80,12 @@ class IgnoreMatcher:
         if not normalized:
             return False
 
-        candidates = [normalized]
-        if is_dir and not normalized.endswith("/"):
-            candidates.append(f"{normalized}/")
+        candidate = f"{normalized}/" if is_dir else normalized
 
         if self._pathspec is not None:
-            return any(self._pathspec.match_file(candidate) for candidate in candidates)
+            return self._pathspec.match_file(candidate)
 
-        return any(
-            _matches_gitignore_pattern(candidate, pattern)
-            for candidate in candidates
-            for pattern in self.patterns
-        )
+        return _matches_gitignore_patterns(candidate, self.patterns)
 
 
 def normalize_rel_path(rel_path: str | Path) -> str:
@@ -709,14 +703,29 @@ def main() -> None:
     print("Result     : sync completed")
 
 
+def _matches_gitignore_patterns(rel_path: str, patterns: list[str]) -> bool:
+    matched = False
+    for pattern in patterns:
+        raw_pattern = pattern.strip()
+        if not raw_pattern:
+            continue
+
+        negated = raw_pattern.startswith("!")
+        if negated:
+            raw_pattern = raw_pattern[1:]
+
+        if _matches_gitignore_pattern(rel_path, raw_pattern):
+            matched = not negated
+
+    return matched
+
+
 def _matches_gitignore_pattern(rel_path: str, pattern: str) -> bool:
     path = normalize_rel_path(rel_path)
     if not path:
         return False
 
     raw_pattern = pattern.strip()
-    if raw_pattern.startswith("!"):
-        raw_pattern = raw_pattern[1:]
     if not raw_pattern:
         return False
 

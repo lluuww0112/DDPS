@@ -38,14 +38,13 @@ vlm:
   image_max_side: null
   contact_sheet_columns: null
   processor_kwargs: {}
-  model_kwargs: {}
+  model_kwargs: 
+    device_map: "cuda:1" # set specific cuda device here or "auto" 
   local_model_dir: "./model/repo"
-  # Max VLM generation batch size used by answer_*_batch when no explicit
-  # batch_size is provided. null means process the whole requested batch at once.
-  inference_batch_size: 10
+  inference_batch_size: 36 # set inference batch size here (eval.vqav2.eval_batch_size has higher priority than this option)
   generation_kwargs:
     do_sample: false
-    max_new_tokens: 256
+    max_new_tokens: 10
 
 invoke:
   task: "auto"
