@@ -200,7 +200,7 @@ def _to_abs_path(path_value: str | None) -> Path | None:
     return Path(to_absolute_path(str(path_value))).expanduser().resolve()
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="val")
+@hydra.main(version_base=None, config_path="../../config", config_name="val")
 def main(config: DictConfig) -> None:
     val_config = config.get("egoschema_val")
     if val_config is None:

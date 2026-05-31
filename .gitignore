@@ -2,10 +2,13 @@
 .venv/
 __pycache__/
 *.pyc
-/data
+/data/*
+!/data/download/
+!/data/download/**
 /outputs
 /model/repo
 /utils/*.json
 /eval/result
 /test/artifacts
 /test/history
+*.log

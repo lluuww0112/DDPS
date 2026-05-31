@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
 import sys
 import tempfile
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -29,28 +31,21 @@ from eval.runtime_metrics import (
 )
 
 
-QUESTION_FILE_CANDIDATES = ("question.json", "questions.json")
-UID_MAP_FILE_CANDIDATES = ("uid_to_ego4d.json", "uid_to_url.json")
-VIDEO_DIR_CANDIDATES = (
-    "EgoSchema_videos",
-    "Egochema_videos",
-    "egoschema_videos",
-    "videos",
-)
-OPTION_KEY_PATTERN = re.compile(r"^option[\s_]*(\d+)$", re.IGNORECASE)
+QUESTION_FILE_CANDIDATES = ("val.csv", "train.csv")
+VIDEO_DIR_CANDIDATES = ("videos", "video", "NExTVideo")
 INDEX_PATTERN = re.compile(r"\b(?:answer|option|choice)?\s*[:#\-]?\s*([0-9])\b", re.IGNORECASE)
 LETTER_PATTERN = re.compile(r"\b(?:answer|option|choice)?\s*[:#\-]?\s*([A-E])\b", re.IGNORECASE)
-VIDEO_UID_FROM_URL_PATTERN = re.compile(r"/([^/?#]+)\.mp4(?:[?#]|$)", re.IGNORECASE)
 
 
 @dataclass(slots=True)
-class EgoSchemaSample:
+class NextQASample:
     q_uid: str
+    video_id: str
     question: str
     options: list[str]
     answer: int | None
+    question_type: str | None
     raw_item: dict[str, Any]
-    uid_metadata: dict[str, Any]
     video_path: Path
 
 
@@ -76,7 +71,7 @@ def _resolve_experiment_config_path(experiment_value: Any) -> Path:
     if experiment_value is None or not str(experiment_value).strip():
         raise ValueError(
             "`experiment` must be provided. "
-            "Example: `python -m eval.egoschema experiment=base` or `experiment=patch`."
+            "Example: `python -m eval.nextqa experiment=base` or `experiment=trips`."
         )
 
     raw_value = str(experiment_value).strip()
@@ -119,8 +114,9 @@ def _find_named_path(
 ) -> Path | None:
     candidate_roots = [
         search_root,
-        search_root / "EgoSchema",
-        search_root / "EgoSchema" / "EgoSchema",
+        search_root / "nextqa",
+        search_root / "Next-QA",
+        search_root / "NExTVideo" / "nextqa",
     ]
     for root in candidate_roots:
         for name in names:
@@ -138,14 +134,14 @@ def _find_named_path(
     return None
 
 
-def _resolve_dataset_layout(eval_config: DictConfig | None) -> tuple[Path, Path, Path, Path]:
+def _resolve_dataset_layout(eval_config: DictConfig | None) -> tuple[Path, Path, Path]:
     dataset_root = _to_abs_path(
-        str(eval_config.get("dataset_root")) if eval_config and eval_config.get("dataset_root") else "./EgoSchema"
+        str(eval_config.get("dataset_root")) if eval_config and eval_config.get("dataset_root") else "./nextqa"
     )
     if dataset_root is None or not dataset_root.exists():
         raise FileNotFoundError(
-            "EgoSchema dataset root could not be found. "
-            "Set `egoschema.dataset_root` to the dataset directory."
+            "NextQA dataset root could not be found. "
+            "Set `nextqa.dataset_root` to the dataset directory."
         )
 
     questions_file = _to_abs_path(
@@ -159,23 +155,8 @@ def _resolve_dataset_layout(eval_config: DictConfig | None) -> tuple[Path, Path,
         )
     if questions_file is None:
         raise FileNotFoundError(
-            "Could not find EgoSchema question file. "
+            "Could not find NextQA question file. "
             f"Looked for: {QUESTION_FILE_CANDIDATES}"
-        )
-
-    uid_map_file = _to_abs_path(
-        str(eval_config.get("uid_map_file")) if eval_config and eval_config.get("uid_map_file") else None
-    )
-    if uid_map_file is None:
-        uid_map_file = _find_named_path(
-            dataset_root,
-            names=UID_MAP_FILE_CANDIDATES,
-            expect_dir=False,
-        )
-    if uid_map_file is None:
-        raise FileNotFoundError(
-            "Could not find a supported EgoSchema uid map file in the dataset. "
-            f"Looked for: {UID_MAP_FILE_CANDIDATES}"
         )
 
     videos_dir = _to_abs_path(
@@ -189,168 +170,102 @@ def _resolve_dataset_layout(eval_config: DictConfig | None) -> tuple[Path, Path,
         )
     if videos_dir is None:
         raise FileNotFoundError(
-            "Could not find EgoSchema video directory. "
+            "Could not find NextQA video directory. "
             f"Looked for: {VIDEO_DIR_CANDIDATES}"
         )
 
-    return dataset_root, questions_file, uid_map_file, videos_dir
+    return dataset_root, questions_file, videos_dir
 
 
-def _load_json_file(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def _load_question_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [dict(row) for row in reader]
 
 
-def _extract_video_uid_from_url(url: str) -> str | None:
-    match = VIDEO_UID_FROM_URL_PATTERN.search(url.strip())
-    if match is None:
-        return None
-    video_uid = match.group(1).strip()
-    return video_uid or None
-
-
-def _extract_question_items(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [dict(item) for item in payload]
-    if isinstance(payload, dict):
-        for key in ("questions", "data", "items", "annotations"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [dict(item) for item in value]
-        return [dict(value, q_uid=str(key)) for key, value in payload.items() if isinstance(value, dict)]
-    raise TypeError("Unsupported EgoSchema question payload format.")
-
-
-def _extract_question_uid(item: dict[str, Any]) -> str:
-    for key in ("q_uid", "quid", "uid", "question_uid"):
-        value = item.get(key)
-        if value is not None:
-            return str(value)
-    raise ValueError(f"Question item is missing a uid field: keys={sorted(item)}")
-
-
-def _extract_question_text(item: dict[str, Any]) -> str:
-    for key in ("question", "query", "text", "prompt"):
-        value = item.get(key)
-        if value is not None:
-            question = str(value).strip()
-            if question:
-                return question
-    raise ValueError("Question item does not contain a non-empty question text.")
-
-
-def _extract_options(item: dict[str, Any]) -> list[str]:
-    indexed_options: list[tuple[int, str]] = []
-    for key, value in item.items():
-        match = OPTION_KEY_PATTERN.match(str(key))
-        if match and value is not None:
-            indexed_options.append((int(match.group(1)), str(value).strip()))
-
-    if indexed_options:
-        indexed_options.sort(key=lambda pair: pair[0])
-        return [option for _, option in indexed_options]
-
-    choices = item.get("choices") or item.get("options") or item.get("candidates")
-    if isinstance(choices, list):
-        return [str(choice).strip() for choice in choices]
-
-    raise ValueError("Question item does not contain any options.")
+def _extract_question_uid(item: dict[str, Any], index: int) -> str:
+    q_uid = item.get("qid")
+    if q_uid not in (None, ""):
+        video_id = str(item.get("video", "")).strip()
+        q_uid_text = str(q_uid).strip()
+        if video_id:
+            return f"{video_id}:{q_uid_text}"
+        return q_uid_text
+    return str(index)
 
 
 def _extract_answer_index(item: dict[str, Any]) -> int | None:
-    for key in ("answer", "label", "answer_idx", "correct_option", "target"):
-        if key not in item or item[key] is None:
-            continue
-        value = item[key]
-        if isinstance(value, int):
-            return int(value)
-        text = str(value).strip()
-        if text.isdigit():
-            return int(text)
-        match = LETTER_PATTERN.search(text.upper())
-        if match:
-            return ord(match.group(1)) - ord("A")
+    answer = item.get("answer")
+    if answer in (None, ""):
+        return None
+    text = str(answer).strip()
+    if text.isdigit():
+        return int(text)
     return None
+
+
+def _extract_options(item: dict[str, Any]) -> list[str]:
+    return [str(item[f"a{index}"]).strip() for index in range(5)]
 
 
 def _resolve_video_path(
     *,
     videos_dir: Path,
-    q_uid: str,
-    raw_item: dict[str, Any],
-    uid_metadata: dict[str, Any],
+    video_id: str,
 ) -> Path:
-    candidate_stems = [q_uid]
-    for key in ("video_uid", "video_id", "uid", "google_drive_id"):
-        value = uid_metadata.get(key)
-        if value is not None:
-            candidate_stems.append(str(value))
-    for key in ("video_uid", "video_id", "uid", "google_drive_id"):
-        value = raw_item.get(key)
-        if value is not None:
-            candidate_stems.append(str(value))
-
-    for stem in candidate_stems:
-        candidate = videos_dir / f"{stem}.mp4"
+    candidates = [
+        videos_dir / f"{video_id}.mp4",
+        videos_dir / f"{video_id}.avi",
+        videos_dir / f"{video_id}.webm",
+    ]
+    for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
 
+    # Some NextQA layouts shard videos into subdirectories such as
+    # videos/0000/2440175990.mp4, so fall back to a recursive index by stem.
+    indexed_path = _index_videos_by_stem(str(videos_dir.resolve())).get(str(video_id))
+    if indexed_path is not None:
+        return Path(indexed_path)
+
     raise FileNotFoundError(
-        f"Could not find EgoSchema video for q_uid={q_uid} under {videos_dir}"
+        f"Could not find NextQA video for video_id={video_id} under {videos_dir}"
     )
 
 
-def _normalize_uid_metadata(uid_metadata_raw: Any) -> dict[str, Any]:
-    if isinstance(uid_metadata_raw, dict):
-        uid_metadata = dict(uid_metadata_raw)
-    elif isinstance(uid_metadata_raw, str):
-        uid_metadata = {"url": uid_metadata_raw}
-    elif uid_metadata_raw is None:
-        uid_metadata = {}
-    else:
-        uid_metadata = {"value": uid_metadata_raw}
-
-    for url_key in ("url", "video_url"):
-        url_value = uid_metadata.get(url_key)
-        if not isinstance(url_value, str):
+@lru_cache(maxsize=4)
+def _index_videos_by_stem(videos_dir: str) -> dict[str, str]:
+    root = Path(videos_dir)
+    indexed: dict[str, str] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
             continue
-        video_uid = _extract_video_uid_from_url(url_value)
-        if video_uid is not None:
-            uid_metadata.setdefault("video_uid", video_uid)
-            break
-
-    return uid_metadata
+        if path.suffix.lower() not in {".mp4", ".avi", ".webm"}:
+            continue
+        indexed.setdefault(path.stem, str(path.resolve()))
+    return indexed
 
 
 def _load_samples(
     *,
     questions_file: Path,
-    uid_map_file: Path,
     videos_dir: Path,
-) -> list[EgoSchemaSample]:
-    question_items = _extract_question_items(_load_json_file(questions_file))
-    uid_map_payload = _load_json_file(uid_map_file)
-    if not isinstance(uid_map_payload, dict):
-        raise TypeError(f"`{uid_map_file.name}` must contain a JSON object.")
-
-    samples: list[EgoSchemaSample] = []
-    for item in question_items:
-        q_uid = _extract_question_uid(item)
-        uid_metadata = _normalize_uid_metadata(uid_map_payload.get(q_uid))
+) -> list[NextQASample]:
+    rows = _load_question_rows(questions_file)
+    samples: list[NextQASample] = []
+    for index, item in enumerate(rows):
+        q_uid = _extract_question_uid(item, index)
+        video_id = str(item["video"]).strip()
         samples.append(
-            EgoSchemaSample(
+            NextQASample(
                 q_uid=q_uid,
-                question=_extract_question_text(item),
+                video_id=video_id,
+                question=str(item["question"]).strip(),
                 options=_extract_options(item),
                 answer=_extract_answer_index(item),
+                question_type=str(item.get("type")).strip() if item.get("type") not in (None, "") else None,
                 raw_item=item,
-                uid_metadata=uid_metadata,
-                video_path=_resolve_video_path(
-                    videos_dir=videos_dir,
-                    q_uid=q_uid,
-                    raw_item=item,
-                    uid_metadata=uid_metadata,
-                ),
+                video_path=_resolve_video_path(videos_dir=videos_dir, video_id=video_id),
             )
         )
     return samples
@@ -390,7 +305,7 @@ def _build_option_block(options: list[str]) -> str:
 def _render_prompt(
     *,
     prompt_template: dict[str, str],
-    sample: EgoSchemaSample,
+    sample: NextQASample,
 ) -> dict[str, str]:
     option_block = _build_option_block(sample.options)
     query_text = "\n".join(
@@ -404,13 +319,15 @@ def _render_prompt(
     format_values = _SafeFormatDict(
         {
             "q_uid": sample.q_uid,
-            "uid": sample.q_uid,
+            "qid": sample.q_uid,
+            "video_id": sample.video_id,
             "question": sample.question,
             "query": query_text,
             "options": option_block,
             "option_block": option_block,
             "candidate_answers": option_block,
             "num_options": len(sample.options),
+            "question_type": sample.question_type or "",
             **{f"option_{index}": option for index, option in enumerate(sample.options)},
         }
     )
@@ -512,27 +429,23 @@ def _format_accuracy(correct: int, labeled_count: int) -> str:
     return f"{(correct / labeled_count):.4f}"
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="eval")
+@hydra.main(version_base=None, config_path="../../config", config_name="eval")
 def main(config: DictConfig) -> None:
     experiment_path = _resolve_experiment_config_path(config.get("experiment"))
     experiment_config = OmegaConf.load(experiment_path)
     if not isinstance(experiment_config, DictConfig):
-        raise TypeError(
-            f"Experiment config must load as DictConfig: {experiment_path}"
-        )
+        raise TypeError(f"Experiment config must load as DictConfig: {experiment_path}")
 
     runtime_config = OmegaConf.merge(experiment_config, config)
-    eval_config = runtime_config.get("egoschema")
+    eval_config = runtime_config.get("nextqa")
     if eval_config is None:
         raise ValueError(
-            "`egoschema` section must be provided in the eval config. "
+            "`nextqa` section must be provided in the eval config. "
             "Use `config/eval.yaml` or pass `--config-name eval`."
         )
     invoke_config = runtime_config.get("invoke")
     if invoke_config is None:
-        raise ValueError(
-            "`invoke` section must be provided in the experiment config."
-        )
+        raise ValueError("`invoke` section must be provided in the experiment config.")
 
     prompt_file_value = invoke_config.get("prompt_file")
     if not prompt_file_value:
@@ -540,10 +453,9 @@ def main(config: DictConfig) -> None:
 
     prompt_file = Path(to_absolute_path(str(prompt_file_value))).resolve()
     prompt_template = _load_prompt_template(prompt_file)
-    dataset_root, questions_file, uid_map_file, videos_dir = _resolve_dataset_layout(eval_config)
+    dataset_root, questions_file, videos_dir = _resolve_dataset_layout(eval_config)
     samples = _load_samples(
         questions_file=questions_file,
-        uid_map_file=uid_map_file,
         videos_dir=videos_dir,
     )
 
@@ -556,10 +468,10 @@ def main(config: DictConfig) -> None:
         samples = samples[:limit]
 
     output_dir = _to_abs_path(
-        str(eval_config.get("output_dir")) if eval_config.get("output_dir") else "./outputs/egoschema"
+        str(eval_config.get("output_dir")) if eval_config.get("output_dir") else "./outputs/nextqa"
     )
     if output_dir is None:
-        raise ValueError("Failed to resolve EgoSchema output directory.")
+        raise ValueError("Failed to resolve NextQA output directory.")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_file_value = str(eval_config.get("output_file")) if eval_config.get("output_file") else None
@@ -589,11 +501,10 @@ def main(config: DictConfig) -> None:
     else:
         pending_samples = samples
 
-    print("=== EgoSchema Evaluation Setup ===")
+    print("=== NextQA Evaluation Setup ===")
     print(f"Experiment   : {experiment_path}")
     print(f"Dataset Root : {dataset_root}")
     print(f"Questions    : {questions_file}")
-    print(f"UID Map      : {uid_map_file}")
     print(f"Videos Dir   : {videos_dir}")
     print(f"Prompt File  : {prompt_file}")
     print(f"Output File  : {output_path}")
@@ -613,7 +524,7 @@ def main(config: DictConfig) -> None:
     ):
         vlm = build_vlm(runtime_config)
 
-    temp_dir = tempfile.TemporaryDirectory(prefix="egoschema_query_")
+    temp_dir = tempfile.TemporaryDirectory(prefix="nextqa_query_")
     try:
         dynamic_query_file = Path(temp_dir.name) / "query.txt"
         dynamic_query_enabled, dynamic_query_targets = _configure_dynamic_query_file(vlm, dynamic_query_file)
@@ -636,7 +547,7 @@ def main(config: DictConfig) -> None:
 
         progress_bar = tqdm(
             pending_samples,
-            desc="EgoSchema Eval",
+            desc="NextQA Eval",
             unit="sample",
             dynamic_ncols=True,
             disable=len(pending_samples) == 0,
@@ -677,6 +588,7 @@ def main(config: DictConfig) -> None:
 
             result = {
                 "q_uid": sample.q_uid,
+                "video_id": sample.video_id,
                 "video_path": str(sample.video_path),
                 "query_text": query_text if dynamic_query_enabled else None,
                 "question": sample.question,
@@ -687,7 +599,8 @@ def main(config: DictConfig) -> None:
                 "correct": is_correct,
                 "parse_method": parse_method,
                 "response": response,
-                "uid_metadata": sample.uid_metadata,
+                "question_type": sample.question_type,
+                "raw_item": sample.raw_item,
                 "dynamic_query_file": str(dynamic_query_file) if dynamic_query_enabled else None,
                 **runtime_metrics,
             }
@@ -704,7 +617,7 @@ def main(config: DictConfig) -> None:
         progress_bar.close()
 
         print()
-        print("=== EgoSchema Evaluation Summary ===")
+        print("=== NextQA Evaluation Summary ===")
         print(f"Attempted    : {attempted}")
         print(f"Completed    : {completed}")
         print(f"Skipped      : {skipped_existing}")

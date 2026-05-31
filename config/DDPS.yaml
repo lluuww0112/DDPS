@@ -1,3 +1,7 @@
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
 hydra:
   job:
     chdir: false
@@ -20,8 +24,8 @@ patch_selection:
   clip_model_name: "openai/clip-vit-large-patch14"
   clip_dtype: "bf16"
   clip_do_center_crop: false 
-  keep_ratio: 0.3
-  batch_size: 8
+  keep_ratio: 0.1
+  batch_size: 10
   video:
     _target_: model.video.maskclip_patch_selection
     _partial_: ${patch_selection._partial_}
@@ -51,7 +55,7 @@ vlm:
   backend: "llava"
   dtype: "bf16"
   quantization:
-    enabled: false
+    enabled: true
     mode: "4bit"
     skip_vision_encoder: true
     skip_modules: []
@@ -66,17 +70,19 @@ vlm:
   image_max_side: null
   contact_sheet_columns: null
   processor_kwargs: {}
-  model_kwargs: {}
+  model_kwargs: 
+    device_map: "cuda:0" # set specific cuda device here or "auto"
   local_model_dir: "./model/repo"
+  inference_batch_size: 48 # set inference batch size here (eval.vqav2.eval_batch_size has higher priority than this option)
   generation_kwargs:
     do_sample: false
-    max_new_tokens: 128
+    max_new_tokens: 10
 
 invoke:
-  task: "video" # Enum[ "video" | "vqa" ]
-  image_path: null
+  task: "vqa" # Enum[ "video" | "vqa" ]
+  image_path: "./data/image.png"
   video_path: null
   prompt_file: "model/prompt.txt"
   query_file: "model/query.txt"
   print_config: false
-  quiet_model_loading: false
+  quiet_model_loading: true

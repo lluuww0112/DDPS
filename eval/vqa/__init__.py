@@ -1,0 +1,1 @@
+"""VQA evaluation entry points."""

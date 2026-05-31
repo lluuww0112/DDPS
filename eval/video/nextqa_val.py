@@ -173,7 +173,7 @@ def _load_ground_truth_map(questions_file: Path) -> dict[str, int]:
     return labels
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="val")
+@hydra.main(version_base=None, config_path="../../config", config_name="val")
 def main(config: DictConfig) -> None:
     val_config = config.get("nextqa_val")
     if val_config is None:
