@@ -13,7 +13,7 @@ from typing import Any
 
 from PIL import Image
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT_DIR / "config"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -203,7 +203,7 @@ class VQAv2EvalConfig:
             suffix = f"/{split}" if split else ""
             raise FileNotFoundError(
                 "VQAv2 dataset root could not be found. "
-                f"Set `vqav2.dataset_root` to the directory created by `vqa_v2_download.py`{suffix}."
+                f"Set `vqav2.dataset_root` to the directory created by `vqa_v2.py`{suffix}."
             )
         return root.resolve()
 
@@ -830,7 +830,7 @@ def _experiment_config_path(value: Any) -> Path:
     if value is None or not str(value).strip():
         raise ValueError(
             "`experiment` must be provided. "
-            "Example: `python -m eval.vqa.vqa_v2 experiment=base` or `experiment=DDPS`."
+            "Example: `python -m eval.vqa_v2 experiment=base` or `experiment=DDPS`."
         )
 
     raw = Path(str(value).strip()).expanduser()
@@ -893,7 +893,7 @@ _normalize_answer = _DEFAULT_SCORER.normalize
 _score_vqa_answer = _DEFAULT_SCORER.score
 
 
-@hydra.main(version_base=None, config_path="../../config", config_name="eval")
+@hydra.main(version_base=None, config_path="../config", config_name="eval")
 def main(config: DictConfig) -> None:
     VQAv2Evaluator(config).run()
 

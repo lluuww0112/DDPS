@@ -9,14 +9,6 @@ hydra:
   run:
     dir: .
 
-# Optional video path support. LLaVA-1.5 is an image VLM, so video inputs are
-# represented as a sampled contact sheet before entering the VQA path.
-frame_selection:
-  _target_: model.video.uniform_sampling
-  _partial_: true
-  num_frames: 10
-  max_side: 480
-
 vlm:
   _target_: model.vlm.BaseVLM
   model_id: "llava-hf/llava-1.5-7b-hf"
@@ -33,15 +25,13 @@ vlm:
       bnb_4bit_use_double_quant: true
       llm_int8_threshold: 6.0
       llm_int8_enable_fp32_cpu_offload: false
-  frame_selector: ${frame_selection}
   patch_selector: null
   image_max_side: null
-  contact_sheet_columns: null
   processor_kwargs: {}
   model_kwargs: 
     device_map: "cuda:1" # set specific cuda device here or "auto" 
   local_model_dir: "./model/repo"
-  inference_batch_size: 36 # set inference batch size here (eval.vqav2.eval_batch_size has higher priority than this option)
+  inference_batch_size: 36 # set inference batch size here (config/eval.yaml vqav2.eval_batch_size has higher priority than this option)
   generation_kwargs:
     do_sample: false
     max_new_tokens: 10
@@ -49,7 +39,6 @@ vlm:
 invoke:
   task: "auto"
   image_path: "./data/image.png"
-  video_path: null
   prompt_file: "model/prompt.txt"
   query_file: "model/query.txt"
   print_config: false
