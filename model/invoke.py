@@ -193,7 +193,6 @@ def summarize_config(config: DictConfig, *, inference_task: str) -> dict[str, An
         "backend": config.vlm.get("backend"),
         "dtype": config.vlm.get("dtype"),
         "local_model_dir": config.vlm.get("local_model_dir"),
-        "inference_batch_size": config.vlm.get("inference_batch_size"),
         "generation_kwargs": generation_kwargs,
     }
 

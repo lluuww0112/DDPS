@@ -192,7 +192,6 @@ class BaseVLM(VLMInterface):
         processor_kwargs: dict[str, Any] | None = None,
         model_kwargs: dict[str, Any] | None = None,
         generation_kwargs: dict[str, Any] | None = None,
-        inference_batch_size: int | None = None,
         dtype: str | torch.dtype | None = None,
         quantization: dict[str, Any] | None = None,
         local_model_dir: str | None = None,
@@ -210,7 +209,6 @@ class BaseVLM(VLMInterface):
         self.processor_kwargs = dict(processor_kwargs or {})
         self.model_kwargs = dict(model_kwargs or {})
         self.generation_kwargs = dict(generation_kwargs or {})
-        self.inference_batch_size = _normalize_max_batch_size(inference_batch_size)
         self.dtype = DTYPE_MAP[dtype] if isinstance(dtype, str) else dtype
         self.quantization = dict(quantization or {})
         self.local_model_dir = (
@@ -1555,10 +1553,8 @@ class BaseVLM(VLMInterface):
             max_batch_size = (
                 _normalize_max_batch_size(batch_size)
                 if batch_size is not None
-                else self.inference_batch_size
+                else len(image_batch)
             )
-            if max_batch_size is None:
-                max_batch_size = len(image_batch)
 
             outputs: list[str] = []
             item_patch_info: list[dict[str, Any]] = []
@@ -1644,10 +1640,8 @@ class BaseVLM(VLMInterface):
         max_batch_size = (
             _normalize_max_batch_size(batch_size)
             if batch_size is not None
-            else self.inference_batch_size
+            else len(image_batch)
         )
-        if max_batch_size is None:
-            max_batch_size = len(image_batch)
 
         outputs: list[str] = []
         total_generate_seconds = 0.0

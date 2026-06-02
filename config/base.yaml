@@ -31,7 +31,6 @@ vlm:
   model_kwargs: 
     device_map: "cuda:1" # set specific cuda device here or "auto" 
   local_model_dir: "./model/repo"
-  inference_batch_size: 36 # set inference batch size here (config/eval.yaml vqav2.eval_batch_size has higher priority than this option)
   generation_kwargs:
     do_sample: false
     max_new_tokens: 10
