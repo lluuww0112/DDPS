@@ -13,14 +13,14 @@ from typing import Any
 
 from PIL import Image
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT_DIR / "config"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import hydra
 from hydra.utils import to_absolute_path
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm.auto import tqdm
 
 from eval.runtime_metrics import (
@@ -172,14 +172,11 @@ class VQAv2EvalConfig:
     cleanup_interval: int
 
     @classmethod
-    def from_config(cls, eval_config: DictConfig, runtime_config: DictConfig) -> VQAv2EvalConfig:
+    def from_config(cls, eval_config: DictConfig) -> VQAv2EvalConfig:
         output_dir = _abs_path(eval_config.get("output_dir") or "./eval/result")
         output_file = eval_config.get("output_file") or "vqav2_eval.jsonl"
         dataset_root = cls._dataset_root(eval_config)
-        batch_size = _positive_int(
-            eval_config.get("eval_batch_size"),
-            _positive_int(runtime_config.get("vlm", {}).get("inference_batch_size"), 1),
-        )
+        batch_size = _positive_int(eval_config.get("eval_batch_size"), 1)
         return cls(
             dataset_root=dataset_root,
             split=_optional_str(eval_config.get("split")),
@@ -203,7 +200,7 @@ class VQAv2EvalConfig:
             suffix = f"/{split}" if split else ""
             raise FileNotFoundError(
                 "VQAv2 dataset root could not be found. "
-                f"Set `vqav2.dataset_root` to the directory created by `vqa_v2_download.py`{suffix}."
+                f"Set `vqav2.dataset_root` to the directory created by `vqa_v2.py`{suffix}."
             )
         return root.resolve()
 
@@ -509,6 +506,9 @@ class JsonlRecorder:
             )
         return totals
 
+    def iter_result_rows(self) -> Iterable[Mapping[str, Any]]:
+        yield from self._iter_result_rows()
+
     def _load(self) -> ExistingOutputState:
         state = ExistingOutputState()
         for row in self._iter_result_rows():
@@ -562,12 +562,17 @@ class VQAv2Evaluator:
                 "`vqav2.prompt_file` or `invoke.prompt_file` must be provided in the config."
             )
 
-        self.settings = VQAv2EvalConfig.from_config(self.eval_config, self.runtime_config)
+        self.settings = VQAv2EvalConfig.from_config(self.eval_config)
+        _align_maskclip_batch_size(self.runtime_config, self.settings.batch_size)
         self.prompt = PromptTemplate(_abs_path(prompt_file))
         self.dataset = VQAv2Dataset(self.settings.dataset_root)
         self.indices = self.dataset.indices(self.settings.start_index, self.settings.limit)
         self.has_answers = self.dataset.has_answers(self.indices)
-        if self.settings.require_answers and not self.has_answers:
+        if (
+            self.settings.require_answers
+            and not self.has_answers
+            and not _is_test_split(self.settings.split)
+        ):
             raise ValueError(
                 "VQAv2 local validation requires public answers, but none were found. "
                 "Use the val split or set `vqav2.require_answers=false` for splits without answers."
@@ -607,7 +612,8 @@ class VQAv2Evaluator:
                 dynamic_query_enabled,
                 runtime_totals,
             )
-        self._print_summary(stats, runtime_totals)
+        submission_path = self._write_submission_if_needed()
+        self._print_summary(stats, runtime_totals, submission_path)
 
     def _run_samples(
         self,
@@ -768,9 +774,43 @@ class VQAv2Evaluator:
             print(f"CUDA Cleanup : every {self.settings.cleanup_interval} processed sample(s)")
         print()
 
-    def _print_summary(self, stats: dict[str, Any], runtime_totals: dict[str, Any]) -> None:
+    def _write_submission_if_needed(self) -> Path | None:
+        if not _is_test_split(self.settings.split):
+            return None
+
+        rows_by_qid: dict[str, Mapping[str, Any]] = {}
+        for row in self.recorder.iter_result_rows():
+            qid = row.get("question_id")
+            if qid is None:
+                continue
+            rows_by_qid[str(qid)] = row
+
+        submission_rows = [
+            {
+                "question_id": _submission_question_id(row["question_id"]),
+                "answer": _submission_answer(row),
+            }
+            for row in sorted(rows_by_qid.values(), key=_submission_sort_key)
+        ]
+
+        submission_path = _submission_path(self.settings.output_path)
+        submission_path.parent.mkdir(parents=True, exist_ok=True)
+        submission_path.write_text(
+            json.dumps(submission_rows, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return submission_path
+
+    def _print_summary(
+        self,
+        stats: dict[str, Any],
+        runtime_totals: dict[str, Any],
+        submission_path: Path | None,
+    ) -> None:
         print("=== VQAv2 Eval Complete ===")
         print(f"Output       : {self.settings.output_path}")
+        if submission_path is not None:
+            print(f"Submission   : {submission_path}")
         print(f"Rows         : {stats['total']}")
         if stats["accuracy"] is None:
             print("Accuracy     : N/A (no public annotations for this split)")
@@ -817,6 +857,36 @@ def _positive_int(value: Any, default: int) -> int:
     return value
 
 
+def _iter_maskclip_patch_selection_configs(value: Any) -> Iterable[DictConfig]:
+    if not isinstance(value, DictConfig):
+        return
+
+    target = value.get("_target_")
+    if target is not None and str(target).endswith("maskclip_patch_selection"):
+        yield value
+
+    for child in value.values():
+        if isinstance(child, DictConfig):
+            yield from _iter_maskclip_patch_selection_configs(child)
+
+
+def _align_maskclip_batch_size(runtime_config: DictConfig, batch_size: int) -> None:
+    seen: set[int] = set()
+    candidates = [runtime_config.get("patch_selection")]
+    vlm_config = runtime_config.get("vlm")
+    if isinstance(vlm_config, DictConfig):
+        candidates.append(vlm_config.get("patch_selector"))
+
+    for candidate in candidates:
+        for selector_config in _iter_maskclip_patch_selection_configs(candidate):
+            selector_id = id(selector_config)
+            if selector_id in seen:
+                continue
+            seen.add(selector_id)
+            with open_dict(selector_config):
+                selector_config.batch_size = int(batch_size)
+
+
 def _json_path(value: Any, output_dir: Path) -> Path:
     raw_path = Path(str(value)).expanduser()
     if raw_path.is_absolute():
@@ -826,11 +896,43 @@ def _json_path(value: Any, output_dir: Path) -> Path:
     return _abs_path(raw_path)
 
 
+def _submission_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_submission.json")
+
+
+def _is_test_split(split: str | None) -> bool:
+    return split is not None and split.strip().lower().startswith("test")
+
+
+def _submission_sort_key(row: Mapping[str, Any]) -> tuple[int, int, str]:
+    index = row.get("index")
+    qid = str(row.get("question_id", ""))
+    if isinstance(index, int):
+        return (0, index, qid)
+    return (1, 0, qid)
+
+
+def _submission_question_id(value: Any) -> int | str:
+    if isinstance(value, int):
+        return value
+    text = str(value)
+    return int(text) if text.isdigit() else text
+
+
+def _submission_answer(row: Mapping[str, Any]) -> str:
+    prediction = row.get("prediction_normalized")
+    if prediction is None:
+        prediction = row.get("prediction")
+    if prediction is None:
+        prediction = ""
+    return _DEFAULT_SCORER.clean(str(prediction))
+
+
 def _experiment_config_path(value: Any) -> Path:
     if value is None or not str(value).strip():
         raise ValueError(
             "`experiment` must be provided. "
-            "Example: `python -m eval.vqa.vqa_v2 experiment=base` or `experiment=DDPS`."
+            "Example: `python -m eval.vqa_v2 experiment=base` or `experiment=DDPS`."
         )
 
     raw = Path(str(value).strip()).expanduser()
@@ -893,7 +995,7 @@ _normalize_answer = _DEFAULT_SCORER.normalize
 _score_vqa_answer = _DEFAULT_SCORER.score
 
 
-@hydra.main(version_base=None, config_path="../../config", config_name="eval")
+@hydra.main(version_base=None, config_path="../config", config_name="eval")
 def main(config: DictConfig) -> None:
     VQAv2Evaluator(config).run()
 

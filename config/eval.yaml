@@ -11,60 +11,29 @@ hydra:
 
 experiment: "base" # 사용할 모델 config 파일 이름
 
-egoschema:
-  dataset_root: "../../EgoSchema" # 데이터 셋 루트 경로, question파일이랑 map파일 값이 null이면 자동으로 데이터 셋 루트에서 탐색함
-  questions_file: "../../EgoSchema/questions.json"
-  uid_map_file: "../../EgoSchema/EgoSchema/uid_to_url.json"
-  videos_dir: "../../EgoSchema/EgoSchema/Egochema_videos"
-  output_dir: "./eval/result"
-  output_file: "./eval/result/ego_pred.jsonl"
-  resume: false # 이전에 연산해둔거 있으면 이어서 실행
-  progress_interval: 10 # tqdm 업데이트 간격
-  start_index: 0 # 시작 샘플 인덱스, 즉 limit이 300이면 0~299의 샘플을 사용
-  limit: null # 테스트할 샘플 수, null로 설정되면 전체 평가
-
-nextqa:
-  dataset_root: "/content/drive/MyDrive/NExTVideo/nextqa" # Colab + Google Drive default root
-  questions_file: "/content/drive/MyDrive/NExTVideo/nextqa/val.csv"
-  videos_dir: "/content/drive/MyDrive/NExTVideo/nextqa/videos"
-  output_dir: "./eval/result"
-  output_file: "./eval/result/nextqa_pred.jsonl"
-  resume: false # resume from existing output file
-  progress_interval: 10 # tqdm update interval
-  start_index: 0 # first sample index
-  limit: null # sample limit, set null for full evaluation
-
-videomme:
-  dataset_root: "/content/drive/MyDrive/Video-MME" # Colab + Google Drive default root
-  annotation_file: "/content/drive/MyDrive/Video-MME/test-00000-of-00001.parquet"
-  videos_dir: "/content/drive/MyDrive/Video-MME/data"
-  video_map_file: null # optional json/csv mapping when the parquet `videoID` does not directly match filenames
-  output_dir: "./eval/result"
-  output_file: "./eval/result/videomme_results.json"
-  debug_output_file: "./eval/result/videomme_debug.jsonl"
-  start_index: 0
-  limit: null
-
-mvbench:
-  dataset_root: "/content/drive/MyDrive/MVBench"
-  annotations_dir: "/content/drive/MyDrive/MVBench/json"
-  data_dir: "/content/drive/MyDrive/MVBench/data"
-  tasks: [] # empty -> run all tasks, or pass [action_sequence]
-  output_dir: "./eval/result"
-  output_file: "./eval/result/mvbench_eval.jsonl"
-  start_index: 0
-  limit: null
-  skip_missing_videos: false # true면 annotation에는 있지만 실제 파일/프레임 디렉토리가 없는 샘플을 건너뜀
-
 vqav2:
-  dataset_root: "/home/data/VQAv2" # split 하위 디렉토리(val/test)를 포함한 VQAv2 루트
-  split: "val" # val은 정답이 있어 로컬 정확도를 바로 계산할 수 있음
-  require_answers: true # val 로컬 평가에서 정답 컬럼이 없으면 즉시 실패
-  prompt_file: "./model/prompt/VQAv2.txt" # VQAv2 공식 short-answer 평가 프롬프트
-  output_dir: "./eval/result"
-  output_file: "./eval/result/vqav2_val_eval.jsonl" # 디버그/재개용 상세 JSONL
+  dataset_root: "./data/VQAv2" # split 하위 디렉토리(val/test)를 포함한 VQAv2 루트
+  split: "test" # val은 정답이 있어 로컬 정확도를 바로 계산할 수 있음
+  require_answers: false # test는 정답이 없으므로 false; val 로컬 평가에서는 true 권장
+  prompt_file: "./model/prompt/short_answer.txt" 
+  output_dir: "./eval/result/VQAv2"
+  output_file: "vqav2_test_DDPS.jsonl" # output_dir 안에 저장할 디버그/재개용 상세 JSONL 파일명
   resume: true # val/test 결과가 섞이지 않도록 기본은 새로 평가
   start_index: 0
   limit: null
-  eval_batch_size: 36 # base/DDPS의 vlm.inference_batch_size보다 우선하는 평가 배치 크기
+  eval_batch_size: 48 # VLM 및 maskCLIP 평가 배치 크기
   empty_cuda_cache_interval: 0 # 0이면 비활성화, 1이면 매 샘플 후 torch.cuda.empty_cache()
+
+gqa:
+  dataset_root: "./data/GQA" # GQA images/questions 루트
+  split: "val" # train/val/testdev/test; 이 값으로 GQA question 파일을 자동 탐색
+  require_answers: false # val 로컬 평가에서는 true 권장
+  prompt_file: "./model/prompt/short_answer.txt" 
+  output_dir: "./eval/result/GQA"
+  output_file: "gqa_val_base.jsonl"
+  resume: true
+  start_index: 0
+  limit: null
+  eval_batch_size: 48
+  empty_cuda_cache_interval: 0
+
