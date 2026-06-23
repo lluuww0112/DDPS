@@ -597,6 +597,7 @@ class BaseVLM(VLMInterface):
         finally:
             if original_padding_side is not None:
                 tokenizer.padding_side = original_padding_side
+
         return self._move_model_inputs_to_device(inputs)
 
     def _decode_generation_outputs(
@@ -758,6 +759,23 @@ class BaseVLM(VLMInterface):
             )
         return image_features
 
+    def _patch_selector_option(self, name: str, default: Any = None) -> Any:
+        selector = self.patch_selector
+        if isinstance(selector, functools.partial):
+            return dict(selector.keywords or {}).get(name, default)
+        return default
+
+    def _resolve_llava_vision_modules(self) -> tuple[Any, Any]:
+        candidates = (getattr(self.model, "model", None), self.model)
+        for candidate in candidates:
+            vision_tower = getattr(candidate, "vision_tower", None)
+            projector = getattr(candidate, "multi_modal_projector", None)
+            if vision_tower is not None and projector is not None:
+                return vision_tower, projector
+        raise RuntimeError(
+            f"Backend `{self.backend}` does not expose LLaVA vision modules."
+        )
+
     def _extract_batch_image_features(
         self,
         model_inputs: dict[str, Any],
@@ -766,6 +784,39 @@ class BaseVLM(VLMInterface):
         if pixel_values is None:
             raise ValueError("Image inputs are required for patch selection.")
         batch_size = int(pixel_values.shape[0])
+        use_internal_rep = bool(self._patch_selector_option("use_internal_rep", False))
+
+        if use_internal_rep:
+            vision_tower, projector = self._resolve_llava_vision_modules()
+            layer = int(getattr(self.model.config, "vision_feature_layer", -2))
+            if layer != -2:
+                raise ValueError(
+                    "`use_internal_rep=true` requires LLaVA `vision_feature_layer=-2` "
+                    "so the representation is the input to the final CLIP block."
+                )
+            vision_outputs = vision_tower(
+                pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            internal_hidden_states = vision_outputs.hidden_states[layer]
+            selected_features = internal_hidden_states
+            strategy = str(
+                getattr(self.model.config, "vision_feature_select_strategy", "default")
+            )
+            if strategy == "default":
+                selected_features = selected_features[:, 1:]
+            image_features = projector(selected_features)
+            image_features = self._coerce_batch_image_features(
+                image_features,
+                batch_size=batch_size,
+            )
+            return image_features, {
+                "image_token_count": int(image_features.shape[1]),
+                "internal_representation": True,
+                "_maskclip_internal_hidden_states": internal_hidden_states,
+                "_maskclip_internal_pooled_output": vision_outputs.pooler_output,
+            }
 
         get_image_features = getattr(self.model, "get_image_features", None)
         if callable(get_image_features):
@@ -783,12 +834,7 @@ class BaseVLM(VLMInterface):
                 feature_kwargs,
             )
         else:
-            vision_tower = getattr(self.model, "vision_tower", None)
-            projector = getattr(self.model, "multi_modal_projector", None)
-            if vision_tower is None or projector is None:
-                raise RuntimeError(
-                    f"Backend `{self.backend}` does not expose LLaVA image features."
-                )
+            vision_tower, projector = self._resolve_llava_vision_modules()
             vision_outputs = vision_tower(
                 pixel_values,
                 output_hidden_states=True,
@@ -1106,6 +1152,7 @@ class BaseVLM(VLMInterface):
         pruned_attention_masks: list[torch.Tensor] = []
         pruned_input_embeds: list[torch.Tensor] = []
         item_metadata: list[dict[str, Any]] = []
+        full_input_embeds = embedding_layer(input_ids)
 
         for item_index in range(batch_size):
             item_input_ids = input_ids[item_index]
@@ -1137,7 +1184,7 @@ class BaseVLM(VLMInterface):
 
             item_pruned_input_ids = item_input_ids[keep_mask]
             item_pruned_attention_mask = item_attention_mask[keep_mask]
-            item_pruned_embeds = embedding_layer(item_pruned_input_ids.unsqueeze(0))[0]
+            item_pruned_embeds = full_input_embeds[item_index, keep_mask].clone()
 
             pruned_image_mask = item_pruned_input_ids == int(image_token_id)
             item_pruned_features = selected_features.to(
@@ -1249,7 +1296,7 @@ class BaseVLM(VLMInterface):
             self.last_patch_selection_info = {
                 "applied": False,
                 "backend": self.backend,
-                **extraction_metadata,
+                **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
                 **selector_runtime_metadata,
                 "selector_metadata": selector_metadata,
                 **pruning_metadata,
@@ -1271,7 +1318,7 @@ class BaseVLM(VLMInterface):
         self.last_patch_selection_info = {
             "applied": True,
             "backend": self.backend,
-            **extraction_metadata,
+            **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
             **pruning_metadata,
             **selector_runtime_metadata,
             "selector_metadata": selector_metadata,
@@ -1324,7 +1371,7 @@ class BaseVLM(VLMInterface):
             item_extraction_metadata = {
                 key: value
                 for key, value in extraction_metadata.items()
-                if key != "batch_size"
+                if key != "batch_size" and not key.startswith("_")
             }
             if selection_outputs is None:
                 selection_output = self._call_patch_selector(
@@ -1375,7 +1422,7 @@ class BaseVLM(VLMInterface):
             self.last_patch_selection_info = {
                 "applied": False,
                 "backend": self.backend,
-                **extraction_metadata,
+                **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
                 "items": item_patch_info,
                 **pruning_metadata,
             }
@@ -1402,7 +1449,11 @@ class BaseVLM(VLMInterface):
         self.last_patch_selection_info = {
             "applied": True,
             "backend": self.backend,
-            **extraction_metadata,
+            **{
+                key: value
+                for key, value in extraction_metadata.items()
+                if not key.startswith("_")
+            },
             **{key: value for key, value in pruning_metadata.items() if key != "items"},
             "items": item_patch_info,
         }

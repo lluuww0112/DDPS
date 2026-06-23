@@ -7,22 +7,11 @@ hydra:
     chdir: false
   output_subdir: null
   run:
+
     dir: .
 
-patch_selection:
-  _target_: model.Selection.DDPS.maskclip_patch_selection
-  _partial_: true
-  query_file: ${invoke.query_file}
-  clip_model_name: "openai/clip-vit-large-patch14"
-  clip_dtype: "bf16"
-  clip_do_center_crop: false
-  use_internal_rep: false # true: LLaVA vision tower 재사용, false: 별도 MaskCLIP vision encoder
-  keep_ratio: 0.1
-  batch_size: 48 # VQAv2 eval에서 vqav2.eval_batch_size와 동일하게 맞춰짐
-
-
 vlm:
-  _target_: model.vlm.BaseVLM
+  _target_: model.Selection.SpaseVLM.vlm.SparseVLMVLM
   model_id: "llava-hf/llava-1.5-7b-hf"
   backend: "llava"
   dtype: "bf16"
@@ -37,11 +26,24 @@ vlm:
       bnb_4bit_use_double_quant: true
       llm_int8_threshold: 6.0
       llm_int8_enable_fp32_cpu_offload: false
-  patch_selector: ${patch_selection}
+  patch_selector: null
+  sparsevlm_config:
+    use_sparsevlm: true
+    # 목표 최종 visual token 수. keep_schedule를 직접 쓰므로 참고값 역할만 합니다.
+    retain_tokens: 58
+    # 원본 SparseVLM v1.0 쪽 설정에 가깝게 V2는 끕니다.
+    use_v2: false
+    pruning_layers: [2, 6, 15]
+    # upstream RETAIN_TOKN=64 스케줄 [66, 30, 17]을 58토큰 목표로 축소한 근사값입니다.
+    keep_schedule: [60, 27, 15]
+    # 원본 v1.0에 가깝게 recycle/merge를 활성화합니다.
+    enable_token_recycling: true
+    recycle_topk_ratio: 0.3
+    recycle_cluster_divisor: 10
   image_max_side: null
   processor_kwargs: {}
-  model_kwargs: 
-    device_map: "cuda:0" # set specific cuda device here or "auto"
+  model_kwargs:
+    device_map: "cuda:2"
   local_model_dir: "./model/repo"
   generation_kwargs:
     do_sample: false

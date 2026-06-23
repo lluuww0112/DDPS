@@ -17,11 +17,11 @@ vqav2:
   require_answers: false # test는 정답이 없으므로 false; val 로컬 평가에서는 true 권장
   prompt_file: "./model/prompt/short_answer.txt" 
   output_dir: "./eval/result/VQAv2"
-  output_file: "vqav2_test_DDPS.jsonl" # output_dir 안에 저장할 디버그/재개용 상세 JSONL 파일명
+  output_file: "vqav2_test_FastV.jsonl" # output_dir 안에 저장할 디버그/재개용 상세 JSONL 파일명
   resume: true # val/test 결과가 섞이지 않도록 기본은 새로 평가
   start_index: 0
   limit: null
-  eval_batch_size: 48 # VLM 및 maskCLIP 평가 배치 크기
+  eval_batch_size: 48 # VLM 및 maskCLIP 평가 배치 크기 (DDPS는 48이 가장 효율 좋음)
   empty_cuda_cache_interval: 0 # 0이면 비활성화, 1이면 매 샘플 후 torch.cuda.empty_cache()
 
 gqa:
@@ -30,7 +30,7 @@ gqa:
   require_answers: false # val 로컬 평가에서는 true 권장
   prompt_file: "./model/prompt/short_answer.txt" 
   output_dir: "./eval/result/GQA"
-  output_file: "gqa_val_base.jsonl"
+  output_file: "gqa_val_sparseVLM.jsonl"
   resume: true
   start_index: 0
   limit: null

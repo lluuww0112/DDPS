@@ -9,7 +9,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from safetensors import safe_open
 from transformers import AutoTokenizer, CLIPImageProcessor
+from transformers.utils.hub import cached_file
 
 from .clip_model import CLIPTextModel, CLIPVisionModelV2
 
@@ -272,11 +274,104 @@ def _load_maskclip_components(
     return image_processor, tokenizer, vision_model, text_model
 
 
+@lru_cache(maxsize=4)
+def _load_internal_maskclip_components(
+    clip_model_name: str,
+    device_key: str,
+    clip_dtype_key: str,
+) -> tuple[Any, CLIPTextModel, torch.Tensor]:
+    clip_dtype, _ = _resolve_clip_dtype(clip_dtype_key)
+    tokenizer = AutoTokenizer.from_pretrained(clip_model_name)
+    text_model = CLIPTextModel(clip_model_name)
+    checkpoint_path = cached_file(
+        clip_model_name,
+        "model.safetensors",
+    )
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"Could not resolve model.safetensors for `{clip_model_name}`."
+        )
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+        projection_weight = checkpoint.get_tensor("visual_projection.weight")
+
+    if clip_dtype is None:
+        text_model = text_model.to(device_key)
+        projection_weight = projection_weight.to(device=device_key)
+    else:
+        text_model = text_model.to(device=device_key, dtype=clip_dtype)
+        projection_weight = projection_weight.to(device=device_key, dtype=clip_dtype)
+    text_model.eval()
+    return tokenizer, text_model, projection_weight
+
+
+def _resolve_internal_vision_tower(model: Any) -> Any:
+    for candidate in (getattr(model, "model", None), model):
+        vision_tower = getattr(candidate, "vision_tower", None)
+        if vision_tower is not None:
+            return vision_tower
+    raise RuntimeError("Could not resolve LLaVA vision tower for internal MaskCLIP.")
+
+
+def _compute_internal_maskclip_scores(
+    *,
+    model: Any,
+    extraction_metadata: dict[str, Any],
+    text_embeddings: torch.Tensor,
+    projection_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    hidden_states = extraction_metadata.get("_maskclip_internal_hidden_states")
+    pooled_output = extraction_metadata.get("_maskclip_internal_pooled_output")
+    if not isinstance(hidden_states, torch.Tensor) or not isinstance(
+        pooled_output, torch.Tensor
+    ):
+        raise ValueError(
+            "Internal MaskCLIP features were not provided by the VLM extraction path."
+        )
+
+    vision_tower = _resolve_internal_vision_tower(model)
+    last_layer = vision_tower.vision_model.encoder.layers[-1]
+    dense_features = last_layer.layer_norm1(hidden_states)
+    dense_features = last_layer.self_attn.v_proj(dense_features)
+    dense_features = last_layer.self_attn.out_proj(dense_features)
+    dense_features = F.linear(dense_features, projection_weight)[:, 1:, :]
+    dense_features = F.normalize(dense_features, dim=-1)
+    image_features = F.normalize(
+        F.linear(pooled_output, projection_weight),
+        dim=-1,
+    )
+
+    if text_embeddings.ndim == 1:
+        patch_scores = dense_features @ text_embeddings
+        image_scores = image_features @ text_embeddings
+    elif text_embeddings.ndim == 2:
+        patch_scores = torch.einsum("bnd,bd->bn", dense_features, text_embeddings)
+        image_scores = torch.einsum("bd,bd->b", image_features, text_embeddings)
+    else:
+        raise ValueError(
+            "Text embedding must have shape (D,) or (B, D), "
+            f"got {tuple(text_embeddings.shape)}."
+        )
+
+    token_count = int(patch_scores.shape[1])
+    grid_size = int(math.isqrt(token_count))
+    if grid_size * grid_size != token_count:
+        raise ValueError(
+            "Internal MaskCLIP currently requires a square vision patch grid, "
+            f"got {token_count} tokens."
+        )
+    return (
+        patch_scores.view(patch_scores.shape[0], grid_size, grid_size),
+        image_scores,
+        (grid_size, grid_size),
+    )
+
+
 def preload_maskclip_patch_selection(
     *,
     clip_model_name: str = "openai/clip-vit-base-patch16",
     clip_dtype: str | torch.dtype | None = None,
     clip_do_center_crop: bool | None = None,
+    use_internal_rep: bool = False,
     device: str | torch.device | None = None,
     model: Any,
     **_: Any,
@@ -284,12 +379,19 @@ def preload_maskclip_patch_selection(
     preload_device = torch.device(device) if device is not None else _resolve_model_device(model)
     device_key = _resolve_device_key(preload_device)
     _, clip_dtype_key = _resolve_clip_dtype(clip_dtype)
-    _load_maskclip_components(
-        clip_model_name,
-        device_key,
-        clip_dtype_key,
-        clip_do_center_crop,
-    )
+    if use_internal_rep:
+        _load_internal_maskclip_components(
+            clip_model_name,
+            device_key,
+            clip_dtype_key,
+        )
+    else:
+        _load_maskclip_components(
+            clip_model_name,
+            device_key,
+            clip_dtype_key,
+            clip_do_center_crop,
+        )
 
 
 def _encode_text_queries(
@@ -453,7 +555,6 @@ def _compute_dense_patch_score_maps_and_image_scores(
         clip_grid,
     )
 
-
 def _resize_score_maps(
     score_maps: torch.Tensor,
     *,
@@ -528,9 +629,12 @@ def maskclip_patch_selection(
     clip_model_name: str = "openai/clip-vit-base-patch16",
     clip_dtype: str | torch.dtype | None = None,
     clip_do_center_crop: bool | None = None,
+    use_internal_rep: bool = False,
     batch_size: int = 8,
     image_grid_hw: tuple[int, int] | None = None,
     device: str | torch.device | None = None,
+    extraction_metadata: dict[str, Any] | None = None,
+    model: Any = None,
     **_: Any,
 ) -> PatchSelectionResult:
     token_count = int(image_features.shape[0])
@@ -548,30 +652,49 @@ def maskclip_patch_selection(
         if query_file is None:
             raise ValueError("`query` or `query_file` must be provided for patch selection.")
         resolved_query = _load_query(query_file)
-    image_processor, _, vision_model, _ = _load_maskclip_components(
-        clip_model_name,
-        selector_device_key,
-        clip_dtype_key,
-        clip_do_center_crop,
-    )
-    text_embedding = _load_text_embedding(
-        clip_model_name,
-        selector_device_key,
-        clip_dtype_key,
-        clip_do_center_crop,
-        resolved_query,
-    )
-    dense_score_maps, image_scores, clip_grid = (
-        _compute_dense_patch_score_maps_and_image_scores(
-            [image],
-            image_processor=image_processor,
-            vision_model=vision_model,
-            text_embedding=text_embedding,
-            batch_size=batch_size,
-            device=selector_device,
-            clip_dtype=resolved_clip_dtype,
+    if use_internal_rep:
+        tokenizer, text_model, projection_weight = _load_internal_maskclip_components(
+            clip_model_name,
+            selector_device_key,
+            clip_dtype_key,
         )
-    )
+        text_embedding = _encode_text_query(
+            resolved_query,
+            tokenizer=tokenizer,
+            text_model=text_model,
+            device=selector_device,
+        )
+        dense_score_maps, image_scores, clip_grid = _compute_internal_maskclip_scores(
+            model=model,
+            extraction_metadata=dict(extraction_metadata or {}),
+            text_embeddings=text_embedding,
+            projection_weight=projection_weight,
+        )
+    else:
+        image_processor, _, vision_model, _ = _load_maskclip_components(
+            clip_model_name,
+            selector_device_key,
+            clip_dtype_key,
+            clip_do_center_crop,
+        )
+        text_embedding = _load_text_embedding(
+            clip_model_name,
+            selector_device_key,
+            clip_dtype_key,
+            clip_do_center_crop,
+            resolved_query,
+        )
+        dense_score_maps, image_scores, clip_grid = (
+            _compute_dense_patch_score_maps_and_image_scores(
+                [image],
+                image_processor=image_processor,
+                vision_model=vision_model,
+                text_embedding=text_embedding,
+                batch_size=batch_size,
+                device=selector_device,
+                clip_dtype=resolved_clip_dtype,
+            )
+        )
     score_map = _resize_score_maps(
         dense_score_maps,
         target_height=grid_h,
@@ -600,6 +723,7 @@ def maskclip_patch_selection(
         "selector_type": "maskclip_patch_selection_vqa",
         "selection_mode": "single_image_topk",
         "clip_model_name": clip_model_name,
+        "use_internal_rep": bool(use_internal_rep),
         "clip_dtype": clip_dtype_key,
         "clip_do_center_crop": (
             None if clip_do_center_crop is None else bool(clip_do_center_crop)
@@ -672,9 +796,12 @@ def maskclip_patch_selection_batch(
     clip_model_name: str = "openai/clip-vit-base-patch16",
     clip_dtype: str | torch.dtype | None = None,
     clip_do_center_crop: bool | None = None,
+    use_internal_rep: bool = False,
     batch_size: int = 8,
     image_grid_hw: tuple[int, int] | None = None,
     device: str | torch.device | None = None,
+    extraction_metadata: dict[str, Any] | None = None,
+    model: Any = None,
     **_: Any,
 ) -> list[PatchSelectionResult]:
     image_batch = list(images)
@@ -708,31 +835,143 @@ def maskclip_patch_selection_batch(
     selector_device = _resolve_device(device, feature_batch[0])
     selector_device_key = _resolve_device_key(selector_device)
     resolved_clip_dtype, clip_dtype_key = _resolve_clip_dtype(clip_dtype)
-    image_processor, tokenizer, vision_model, text_model = _load_maskclip_components(
-        clip_model_name,
-        selector_device_key,
-        clip_dtype_key,
-        clip_do_center_crop,
-    )
-    text_embeddings = _encode_text_queries(
-        resolved_queries,
-        tokenizer=tokenizer,
-        text_model=text_model,
-        device=selector_device,
-    )
-    dense_score_maps, image_scores, clip_grid = (
-        _compute_dense_patch_score_maps_and_image_scores(
-            image_batch,
-            image_processor=image_processor,
-            vision_model=vision_model,
-            text_embedding=text_embeddings,
-            batch_size=batch_size,
-            device=selector_device,
-            clip_dtype=resolved_clip_dtype,
+    if use_internal_rep:
+        tokenizer, text_model, projection_weight = _load_internal_maskclip_components(
+            clip_model_name,
+            selector_device_key,
+            clip_dtype_key,
         )
-    )
+        text_embeddings = _encode_text_queries(
+            resolved_queries,
+            tokenizer=tokenizer,
+            text_model=text_model,
+            device=selector_device,
+        )
+        dense_score_maps, image_scores, clip_grid = _compute_internal_maskclip_scores(
+            model=model,
+            extraction_metadata=dict(extraction_metadata or {}),
+            text_embeddings=text_embeddings,
+            projection_weight=projection_weight,
+        )
+    else:
+        image_processor, tokenizer, vision_model, text_model = _load_maskclip_components(
+            clip_model_name,
+            selector_device_key,
+            clip_dtype_key,
+            clip_do_center_crop,
+        )
+        text_embeddings = _encode_text_queries(
+            resolved_queries,
+            tokenizer=tokenizer,
+            text_model=text_model,
+            device=selector_device,
+        )
+        dense_score_maps, image_scores, clip_grid = (
+            _compute_dense_patch_score_maps_and_image_scores(
+                image_batch,
+                image_processor=image_processor,
+                vision_model=vision_model,
+                text_embedding=text_embeddings,
+                batch_size=batch_size,
+                device=selector_device,
+                clip_dtype=resolved_clip_dtype,
+            )
+        )
 
     results: list[PatchSelectionResult] = []
+
+    if torch.is_tensor(image_features) and image_features.ndim == 3:
+        token_count = int(image_features.shape[1])
+        keep_count = _resolve_budget(token_count, keep_ratio=keep_ratio)
+        grids = [
+            infer_feature_grid(
+                token_count,
+                image=image,
+                grid_hw=image_grid_hw,
+            )
+            for image in image_batch
+        ]
+        if len(set(grids)) == 1:
+            grid_h, grid_w = grids[0]
+            resized_scores = _resize_score_maps(
+                dense_score_maps,
+                target_height=grid_h,
+                target_width=grid_w,
+            )
+            flat_scores = resized_scores.flatten(start_dim=1)
+            if keep_count >= token_count:
+                selected_indices_batch = torch.arange(
+                    token_count,
+                    device=flat_scores.device,
+                    dtype=torch.long,
+                ).expand(len(image_batch), -1)
+            else:
+                selected_indices_batch = torch.topk(
+                    flat_scores,
+                    k=keep_count,
+                    dim=1,
+                    largest=True,
+                    sorted=False,
+                ).indices.sort(dim=1).values
+
+            selected_indices_batch = selected_indices_batch.to(
+                device=image_features.device,
+                dtype=torch.long,
+            )
+            selected_features_batch = torch.gather(
+                image_features,
+                dim=1,
+                index=selected_indices_batch.unsqueeze(-1).expand(
+                    -1,
+                    -1,
+                    image_features.shape[-1],
+                ),
+            )
+            score_stats = torch.stack(
+                (
+                    flat_scores.amin(dim=1),
+                    flat_scores.amax(dim=1),
+                    image_scores,
+                ),
+                dim=1,
+            ).float().cpu().tolist()
+
+            for item_index, query in enumerate(resolved_queries):
+                selected_indices = selected_indices_batch[item_index]
+                metadata = {
+                    "selector_type": "maskclip_patch_selection_vqa",
+                    "selection_mode": "batch_image_topk",
+                    "clip_model_name": clip_model_name,
+                    "use_internal_rep": bool(use_internal_rep),
+                    "clip_dtype": clip_dtype_key,
+                    "clip_do_center_crop": (
+                        None if clip_do_center_crop is None else bool(clip_do_center_crop)
+                    ),
+                    "query_file": (
+                        str(Path(query_file).expanduser())
+                        if query_file is not None
+                        else None
+                    ),
+                    "query": query,
+                    "keep_ratio": float(keep_ratio),
+                    "keep_count": int(keep_count),
+                    "clip_grid_hw": [int(clip_grid[0]), int(clip_grid[1])],
+                    "image_grid_hw": [grid_h, grid_w],
+                    "score_min": float(score_stats[item_index][0]),
+                    "score_max": float(score_stats[item_index][1]),
+                    "image_importance_score": float(score_stats[item_index][2]),
+                    "selected_token_count": int(keep_count),
+                    "image_token_count": token_count,
+                }
+                results.append(
+                    PatchSelectionResult(
+                        selected_indices=selected_indices,
+                        selected_features=selected_features_batch[item_index],
+                        metadata=metadata,
+                    )
+                )
+            return results
+
     for item_index, (item_features, image, query) in enumerate(
         zip(feature_batch, image_batch, resolved_queries)
     ):
@@ -770,6 +1009,7 @@ def maskclip_patch_selection_batch(
             "selector_type": "maskclip_patch_selection_vqa",
             "selection_mode": "batch_image_topk",
             "clip_model_name": clip_model_name,
+            "use_internal_rep": bool(use_internal_rep),
             "clip_dtype": clip_dtype_key,
             "clip_do_center_crop": (
                 None if clip_do_center_crop is None else bool(clip_do_center_crop)
