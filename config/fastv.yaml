@@ -9,20 +9,8 @@ hydra:
   run:
     dir: .
 
-patch_selection:
-  _target_: model.Selection.DDPS.maskclip_patch_selection
-  _partial_: true
-  query_file: ${invoke.query_file}
-  clip_model_name: "openai/clip-vit-large-patch14"
-  clip_dtype: "bf16"
-  clip_do_center_crop: false
-  use_internal_rep: false # true: LLaVA vision tower 재사용, false: 별도 MaskCLIP vision encoder
-  keep_ratio: 0.1
-  batch_size: 48 # VQAv2 eval에서 vqav2.eval_batch_size와 동일하게 맞춰짐
-
-
 vlm:
-  _target_: model.vlm.BaseVLM
+  _target_: model.Selection.FastV.vlm.FastVVLM
   model_id: "llava-hf/llava-1.5-7b-hf"
   backend: "llava"
   dtype: "bf16"
@@ -37,11 +25,15 @@ vlm:
       bnb_4bit_use_double_quant: true
       llm_int8_threshold: 6.0
       llm_int8_enable_fp32_cpu_offload: false
-  patch_selector: ${patch_selection}
+  patch_selector: null
+  fastv_config:
+    use_fastv: true
+    fastv_k: 3 # patch selection 계층 선택
+    fastv_r: 0.9 # 전체 토큰 중 제거 토큰 비율
   image_max_side: null
   processor_kwargs: {}
-  model_kwargs: 
-    device_map: "cuda:0" # set specific cuda device here or "auto"
+  model_kwargs:
+    device_map: "cuda:0"
   local_model_dir: "./model/repo"
   generation_kwargs:
     do_sample: false

@@ -23,13 +23,10 @@ from transformers import (
     ProcessorMixin,
 )
 
-from .DDPS.selection import PatchSelectionResult
-from .video.selection import FrameSelectionResult, frames_to_contact_sheet, uniform_sampling
-from .vqa.selection import load_image
+from .Selection.DDPS.selection import PatchSelectionResult, load_image
 
 
 PatchSelector = Callable[..., Any]
-FrameSelector = Callable[..., torch.Tensor | FrameSelectionResult | None]
 PromptInput = str | Mapping[str, Any]
 PromptBatchInput = PromptInput | Sequence[PromptInput]
 
@@ -129,16 +126,6 @@ class VLMInterface(ABC):
     ) -> str:
         raise NotImplementedError
 
-    @abstractmethod
-    def answer_video(
-        self,
-        prompt: PromptInput,
-        *,
-        video_path: str,
-        **selector_kwargs: Any,
-    ) -> str:
-        raise NotImplementedError
-
     def answer_vqa_batch(
         self,
         prompt: PromptBatchInput,
@@ -162,79 +149,37 @@ class VLMInterface(ABC):
             for item_prompt, image_path in zip(prompts, image_path_batch)
         ]
 
-    def answer_video_batch(
-        self,
-        prompt: PromptBatchInput,
-        *,
-        video_paths: Sequence[str],
-        batch_size: int | None = None,
-        **selector_kwargs: Any,
-    ) -> list[str]:
-        video_path_batch = _materialize_batch_sequence(
-            video_paths,
-            label="video_paths",
-        )
-        _normalize_max_batch_size(batch_size)
-        prompts = _expand_batch_prompts(prompt, batch_size=len(video_path_batch))
-        return [
-            self.answer_video(
-                item_prompt,
-                video_path=str(video_path),
-                **selector_kwargs,
-            )
-            for item_prompt, video_path in zip(prompts, video_path_batch)
-        ]
-
     def answer(
         self,
         prompt: PromptInput,
         *,
         image_path: str | None = None,
-        video_path: str | None = None,
         **selector_kwargs: Any,
     ) -> str:
-        if image_path and video_path:
-            raise ValueError("Provide only one of `image_path` or `video_path`.")
-        if image_path:
-            return self.answer_vqa(
-                prompt,
-                image_path=image_path,
-                **selector_kwargs,
-            )
-        if video_path:
-            return self.answer_video(
-                prompt,
-                video_path=video_path,
-                **selector_kwargs,
-            )
-        raise ValueError("One of `image_path` or `video_path` must be provided.")
+        if not image_path:
+            raise ValueError("`image_path` must be provided.")
+        return self.answer_vqa(
+            prompt,
+            image_path=image_path,
+            **selector_kwargs,
+        )
 
     def answer_batch(
         self,
         prompt: PromptBatchInput,
         *,
         image_paths: Sequence[str] | None = None,
-        video_paths: Sequence[str] | None = None,
         batch_size: int | None = None,
         **selector_kwargs: Any,
     ) -> list[str]:
-        if image_paths is not None and video_paths is not None:
-            raise ValueError("Provide only one of `image_paths` or `video_paths`.")
-        if image_paths is not None:
-            return self.answer_vqa_batch(
-                prompt,
-                image_paths=image_paths,
-                batch_size=batch_size,
-                **selector_kwargs,
-            )
-        if video_paths is not None:
-            return self.answer_video_batch(
-                prompt,
-                video_paths=video_paths,
-                batch_size=batch_size,
-                **selector_kwargs,
-            )
-        raise ValueError("One of `image_paths` or `video_paths` must be provided.")
+        if image_paths is None:
+            raise ValueError("`image_paths` must be provided.")
+        return self.answer_vqa_batch(
+            prompt,
+            image_paths=image_paths,
+            batch_size=batch_size,
+            **selector_kwargs,
+        )
 
 
 class BaseVLM(VLMInterface):
@@ -242,18 +187,14 @@ class BaseVLM(VLMInterface):
         self,
         model_id: str = "llava-hf/llava-1.5-7b-hf",
         patch_selector: PatchSelector | None = None,
-        frame_selector: FrameSelector | None = None,
         backend: str = "llava",
         image_max_side: int | None = None,
-        contact_sheet_columns: int | None = None,
         processor_kwargs: dict[str, Any] | None = None,
         model_kwargs: dict[str, Any] | None = None,
         generation_kwargs: dict[str, Any] | None = None,
-        inference_batch_size: int | None = None,
         dtype: str | torch.dtype | None = None,
         quantization: dict[str, Any] | None = None,
         local_model_dir: str | None = None,
-        **frame_selector_kwargs: Any,
     ):
         if backend not in VLM_BACKENDS:
             available = ", ".join(sorted(VLM_BACKENDS))
@@ -261,17 +202,13 @@ class BaseVLM(VLMInterface):
 
         backend_config = VLM_BACKENDS[backend]
         self.patch_selector = patch_selector
-        self.frame_selector = frame_selector
-        self.frame_selector_kwargs = frame_selector_kwargs
         self.backend = backend
         self.image_max_side = image_max_side
-        self.contact_sheet_columns = contact_sheet_columns
         self.processor_cls = backend_config["processor_cls"]
         self.model_cls = backend_config["model_cls"]
         self.processor_kwargs = dict(processor_kwargs or {})
         self.model_kwargs = dict(model_kwargs or {})
         self.generation_kwargs = dict(generation_kwargs or {})
-        self.inference_batch_size = _normalize_max_batch_size(inference_batch_size)
         self.dtype = DTYPE_MAP[dtype] if isinstance(dtype, str) else dtype
         self.quantization = dict(quantization or {})
         self.local_model_dir = (
@@ -315,7 +252,6 @@ class BaseVLM(VLMInterface):
         *,
         prompt: PromptInput | None = None,
         image_path: str | None = None,
-        video_path: str | None = None,
     ) -> None:
         preload_target = self._resolve_preload_hook()
         if preload_target is None:
@@ -326,7 +262,6 @@ class BaseVLM(VLMInterface):
             **selector_kwargs,
             "prompt": prompt,
             "image_path": image_path,
-            "video_path": video_path,
             "processor": self.processor,
             "model": self.model,
             "backend": self.backend,
@@ -584,76 +519,6 @@ class BaseVLM(VLMInterface):
             **image_selection.metadata,
         }
 
-    def _load_video_input(
-        self,
-        *,
-        video_path: str,
-        selector_kwargs: dict[str, Any],
-    ) -> tuple[Image.Image, dict[str, Any]]:
-        frame_selector = self.frame_selector or uniform_sampling
-        frame_selection = self._normalize_frame_selection_output(
-            frame_selector(
-                video_path=video_path,
-                **{**self.frame_selector_kwargs, **selector_kwargs},
-            ),
-            video_path=video_path,
-        )
-        image = frames_to_contact_sheet(
-            frame_selection,
-            columns=self.contact_sheet_columns,
-            annotate=True,
-        )
-        frame_count = int(frame_selection.frames.shape[0]) if frame_selection.frames is not None else 0
-        contact_sheet_columns = self.contact_sheet_columns
-        if contact_sheet_columns is None and frame_count > 0:
-            import math
-
-            contact_sheet_columns = int(math.ceil(math.sqrt(frame_count)))
-        contact_sheet_rows = None
-        if contact_sheet_columns is not None and frame_count > 0:
-            import math
-
-            contact_sheet_rows = int(math.ceil(frame_count / max(int(contact_sheet_columns), 1)))
-        return image, {
-            "type": "video_contact_sheet",
-            **frame_selection.metadata,
-            "contact_sheet_size": list(image.size),
-            "contact_sheet_columns": contact_sheet_columns,
-            "contact_sheet_rows": contact_sheet_rows,
-            "contact_sheet_label_height": 18,
-            "_frame_selection": frame_selection,
-        }
-
-    def _normalize_frame_selection_output(
-        self,
-        selection_output: torch.Tensor | FrameSelectionResult | None,
-        *,
-        video_path: str,
-    ) -> FrameSelectionResult:
-        if selection_output is None:
-            return FrameSelectionResult(
-                frames=None,
-                metadata={"video_path": video_path, "num_frames": 0},
-            )
-        if isinstance(selection_output, FrameSelectionResult):
-            metadata = dict(selection_output.metadata)
-            metadata.setdefault("video_path", video_path)
-            return FrameSelectionResult(
-                frames=selection_output.frames,
-                metadata=metadata,
-            )
-        if torch.is_tensor(selection_output):
-            return FrameSelectionResult(
-                frames=selection_output,
-                metadata={
-                    "video_path": video_path,
-                    "num_frames": int(selection_output.shape[0]),
-                },
-            )
-        raise TypeError(
-            "Frame selector output must be a torch.Tensor, FrameSelectionResult, or None."
-        )
-
     def _model_device(self) -> torch.device:
         device = getattr(self.model, "device", None)
         if device is not None:
@@ -732,6 +597,7 @@ class BaseVLM(VLMInterface):
         finally:
             if original_padding_side is not None:
                 tokenizer.padding_side = original_padding_side
+
         return self._move_model_inputs_to_device(inputs)
 
     def _decode_generation_outputs(
@@ -893,6 +759,23 @@ class BaseVLM(VLMInterface):
             )
         return image_features
 
+    def _patch_selector_option(self, name: str, default: Any = None) -> Any:
+        selector = self.patch_selector
+        if isinstance(selector, functools.partial):
+            return dict(selector.keywords or {}).get(name, default)
+        return default
+
+    def _resolve_llava_vision_modules(self) -> tuple[Any, Any]:
+        candidates = (getattr(self.model, "model", None), self.model)
+        for candidate in candidates:
+            vision_tower = getattr(candidate, "vision_tower", None)
+            projector = getattr(candidate, "multi_modal_projector", None)
+            if vision_tower is not None and projector is not None:
+                return vision_tower, projector
+        raise RuntimeError(
+            f"Backend `{self.backend}` does not expose LLaVA vision modules."
+        )
+
     def _extract_batch_image_features(
         self,
         model_inputs: dict[str, Any],
@@ -901,6 +784,39 @@ class BaseVLM(VLMInterface):
         if pixel_values is None:
             raise ValueError("Image inputs are required for patch selection.")
         batch_size = int(pixel_values.shape[0])
+        use_internal_rep = bool(self._patch_selector_option("use_internal_rep", False))
+
+        if use_internal_rep:
+            vision_tower, projector = self._resolve_llava_vision_modules()
+            layer = int(getattr(self.model.config, "vision_feature_layer", -2))
+            if layer != -2:
+                raise ValueError(
+                    "`use_internal_rep=true` requires LLaVA `vision_feature_layer=-2` "
+                    "so the representation is the input to the final CLIP block."
+                )
+            vision_outputs = vision_tower(
+                pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            internal_hidden_states = vision_outputs.hidden_states[layer]
+            selected_features = internal_hidden_states
+            strategy = str(
+                getattr(self.model.config, "vision_feature_select_strategy", "default")
+            )
+            if strategy == "default":
+                selected_features = selected_features[:, 1:]
+            image_features = projector(selected_features)
+            image_features = self._coerce_batch_image_features(
+                image_features,
+                batch_size=batch_size,
+            )
+            return image_features, {
+                "image_token_count": int(image_features.shape[1]),
+                "internal_representation": True,
+                "_maskclip_internal_hidden_states": internal_hidden_states,
+                "_maskclip_internal_pooled_output": vision_outputs.pooler_output,
+            }
 
         get_image_features = getattr(self.model, "get_image_features", None)
         if callable(get_image_features):
@@ -918,12 +834,7 @@ class BaseVLM(VLMInterface):
                 feature_kwargs,
             )
         else:
-            vision_tower = getattr(self.model, "vision_tower", None)
-            projector = getattr(self.model, "multi_modal_projector", None)
-            if vision_tower is None or projector is None:
-                raise RuntimeError(
-                    f"Backend `{self.backend}` does not expose LLaVA image features."
-                )
+            vision_tower, projector = self._resolve_llava_vision_modules()
             vision_outputs = vision_tower(
                 pixel_values,
                 output_hidden_states=True,
@@ -971,7 +882,6 @@ class BaseVLM(VLMInterface):
             "model_inputs": model_inputs,
             "extraction_metadata": extraction_metadata,
             "visual_metadata": visual_metadata,
-            "frame_selection": visual_metadata.get("_frame_selection"),
             "query": self._selector_query_from_prompt(prompt),
             "processor": self.processor,
             "model": self.model,
@@ -1242,6 +1152,7 @@ class BaseVLM(VLMInterface):
         pruned_attention_masks: list[torch.Tensor] = []
         pruned_input_embeds: list[torch.Tensor] = []
         item_metadata: list[dict[str, Any]] = []
+        full_input_embeds = embedding_layer(input_ids)
 
         for item_index in range(batch_size):
             item_input_ids = input_ids[item_index]
@@ -1273,7 +1184,7 @@ class BaseVLM(VLMInterface):
 
             item_pruned_input_ids = item_input_ids[keep_mask]
             item_pruned_attention_mask = item_attention_mask[keep_mask]
-            item_pruned_embeds = embedding_layer(item_pruned_input_ids.unsqueeze(0))[0]
+            item_pruned_embeds = full_input_embeds[item_index, keep_mask].clone()
 
             pruned_image_mask = item_pruned_input_ids == int(image_token_id)
             item_pruned_features = selected_features.to(
@@ -1377,8 +1288,6 @@ class BaseVLM(VLMInterface):
         selector_runtime_metadata = {
             key: selector_metadata[key]
             for key in (
-                "original_video_tokens",
-                "selected_video_tokens",
                 "reallocated_token_count",
             )
             if key in selector_metadata
@@ -1387,7 +1296,7 @@ class BaseVLM(VLMInterface):
             self.last_patch_selection_info = {
                 "applied": False,
                 "backend": self.backend,
-                **extraction_metadata,
+                **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
                 **selector_runtime_metadata,
                 "selector_metadata": selector_metadata,
                 **pruning_metadata,
@@ -1409,7 +1318,7 @@ class BaseVLM(VLMInterface):
         self.last_patch_selection_info = {
             "applied": True,
             "backend": self.backend,
-            **extraction_metadata,
+            **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
             **pruning_metadata,
             **selector_runtime_metadata,
             "selector_metadata": selector_metadata,
@@ -1462,7 +1371,7 @@ class BaseVLM(VLMInterface):
             item_extraction_metadata = {
                 key: value
                 for key, value in extraction_metadata.items()
-                if key != "batch_size"
+                if key != "batch_size" and not key.startswith("_")
             }
             if selection_outputs is None:
                 selection_output = self._call_patch_selector(
@@ -1486,8 +1395,6 @@ class BaseVLM(VLMInterface):
             selector_runtime_metadata = {
                 key: selector_metadata[key]
                 for key in (
-                    "original_video_tokens",
-                    "selected_video_tokens",
                     "reallocated_token_count",
                 )
                 if key in selector_metadata
@@ -1515,7 +1422,7 @@ class BaseVLM(VLMInterface):
             self.last_patch_selection_info = {
                 "applied": False,
                 "backend": self.backend,
-                **extraction_metadata,
+                **{key: value for key, value in extraction_metadata.items() if not key.startswith("_")},
                 "items": item_patch_info,
                 **pruning_metadata,
             }
@@ -1542,7 +1449,11 @@ class BaseVLM(VLMInterface):
         self.last_patch_selection_info = {
             "applied": True,
             "backend": self.backend,
-            **extraction_metadata,
+            **{
+                key: value
+                for key, value in extraction_metadata.items()
+                if not key.startswith("_")
+            },
             **{key: value for key, value in pruning_metadata.items() if key != "items"},
             "items": item_patch_info,
         }
@@ -1693,10 +1604,8 @@ class BaseVLM(VLMInterface):
             max_batch_size = (
                 _normalize_max_batch_size(batch_size)
                 if batch_size is not None
-                else self.inference_batch_size
+                else len(image_batch)
             )
-            if max_batch_size is None:
-                max_batch_size = len(image_batch)
 
             outputs: list[str] = []
             item_patch_info: list[dict[str, Any]] = []
@@ -1782,10 +1691,8 @@ class BaseVLM(VLMInterface):
         max_batch_size = (
             _normalize_max_batch_size(batch_size)
             if batch_size is not None
-            else self.inference_batch_size
+            else len(image_batch)
         )
-        if max_batch_size is None:
-            max_batch_size = len(image_batch)
 
         outputs: list[str] = []
         total_generate_seconds = 0.0
@@ -1845,23 +1752,6 @@ class BaseVLM(VLMInterface):
             visual_metadata=visual_metadata,
         )
 
-    def answer_video(
-        self,
-        prompt: PromptInput,
-        *,
-        video_path: str,
-        **selector_kwargs: Any,
-    ) -> str:
-        image, visual_metadata = self._load_video_input(
-            video_path=video_path,
-            selector_kwargs=selector_kwargs,
-        )
-        return self._answer_with_visual(
-            prompt,
-            image=image,
-            visual_metadata=visual_metadata,
-        )
-
     def answer_vqa_batch(
         self,
         prompt: PromptBatchInput,
@@ -1889,55 +1779,17 @@ class BaseVLM(VLMInterface):
             batch_size=batch_size,
         )
 
-    def answer_video_batch(
-        self,
-        prompt: PromptBatchInput,
-        *,
-        video_paths: Sequence[str],
-        batch_size: int | None = None,
-        **selector_kwargs: Any,
-    ) -> list[str]:
-        video_path_batch = _materialize_batch_sequence(
-            video_paths,
-            label="video_paths",
-        )
-        prompts = _expand_batch_prompts(prompt, batch_size=len(video_path_batch))
-        images: list[Image.Image] = []
-        visual_metadata: list[dict[str, Any]] = []
-        for video_path in video_path_batch:
-            image, metadata = self._load_video_input(
-                video_path=str(video_path),
-                selector_kwargs=selector_kwargs,
-            )
-            images.append(image)
-            visual_metadata.append(metadata)
-        return self._answer_batch_with_visual(
-            prompts,
-            images=images,
-            visual_metadata=visual_metadata,
-            batch_size=batch_size,
-        )
-
     def answer(
         self,
         prompt: PromptInput,
         *,
         image_path: str | None = None,
-        video_path: str | None = None,
         **selector_kwargs: Any,
     ) -> str:
-        if image_path and video_path:
-            raise ValueError("Provide only one of `image_path` or `video_path`.")
-        if image_path:
-            return self.answer_vqa(
-                prompt,
-                image_path=image_path,
-                **selector_kwargs,
-            )
-        if video_path:
-            return self.answer_video(
-                prompt,
-                video_path=video_path,
-                **selector_kwargs,
-            )
-        raise ValueError("One of `image_path` or `video_path` must be provided.")
+        if not image_path:
+            raise ValueError("`image_path` must be provided.")
+        return self.answer_vqa(
+            prompt,
+            image_path=image_path,
+            **selector_kwargs,
+        )

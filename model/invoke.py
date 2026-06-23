@@ -72,7 +72,6 @@ def resolve_inference_task(invoke_config: DictConfig | None) -> str:
     aliases = {
         "image": "vqa",
         "vqa": "vqa",
-        "video": "video",
         "auto": "auto",
     }
     resolved = aliases.get(normalized)
@@ -165,29 +164,12 @@ def _resolve_existing_path(value: Any, *, label: str) -> Path:
 def resolve_visual_path(invoke_config: DictConfig) -> tuple[str, Path, str]:
     inference_task = resolve_inference_task(invoke_config)
     image_value = invoke_config.get("image_path")
-    video_value = invoke_config.get("video_path")
 
-    if inference_task == "vqa":
-        if video_value:
-            raise ValueError("`invoke.task: vqa` expects `invoke.image_path`, not `invoke.video_path`.")
-        if not image_value:
-            raise ValueError("`invoke.task: vqa` requires `invoke.image_path`.")
-        return "image_path", _resolve_existing_path(image_value, label="Image"), "vqa"
-
-    if inference_task == "video":
-        if image_value:
-            raise ValueError("`invoke.task: video` expects `invoke.video_path`, not `invoke.image_path`.")
-        if not video_value:
-            raise ValueError("`invoke.task: video` requires `invoke.video_path`.")
-        return "video_path", _resolve_existing_path(video_value, label="Video"), "video"
-
-    if image_value and video_value:
-        raise ValueError("Provide only one of `invoke.image_path` or `invoke.video_path`.")
-    if image_value:
-        return "image_path", _resolve_existing_path(image_value, label="Image"), "vqa"
-    if video_value:
-        return "video_path", _resolve_existing_path(video_value, label="Video"), "video"
-    raise ValueError("One of `invoke.image_path` or `invoke.video_path` must be provided.")
+    if inference_task not in {"auto", "vqa"}:
+        raise ValueError(f"Unsupported `invoke.task`: {inference_task}.")
+    if not image_value:
+        raise ValueError("`invoke.image_path` must be provided.")
+    return "image_path", _resolve_existing_path(image_value, label="Image"), "vqa"
 
 
 def summarize_config(config: DictConfig, *, inference_task: str) -> dict[str, Any]:
@@ -195,12 +177,6 @@ def summarize_config(config: DictConfig, *, inference_task: str) -> dict[str, An
     patch_selection = (
         OmegaConf.to_container(patch_selection_cfg, resolve=True)
         if patch_selection_cfg is not None
-        else None
-    )
-    frame_selection_cfg = config.get("frame_selection") if inference_task == "video" else None
-    frame_selection = (
-        OmegaConf.to_container(frame_selection_cfg, resolve=True)
-        if frame_selection_cfg is not None
         else None
     )
     generation_kwargs = OmegaConf.to_container(
@@ -211,14 +187,12 @@ def summarize_config(config: DictConfig, *, inference_task: str) -> dict[str, An
 
     return {
         "inference_task": inference_task,
-        "frame_selection": frame_selection,
         "patch_selection": patch_selection,
         "invoke": invoke_config,
         "model_id": config.vlm.get("model_id"),
         "backend": config.vlm.get("backend"),
         "dtype": config.vlm.get("dtype"),
         "local_model_dir": config.vlm.get("local_model_dir"),
-        "inference_batch_size": config.vlm.get("inference_batch_size"),
         "generation_kwargs": generation_kwargs,
     }
 
@@ -260,9 +234,6 @@ def main(config: DictConfig) -> None:
     resolved_model_source = getattr(vlm, "resolved_model_source", None)
     if resolved_model_source and str(resolved_model_source) != str(summary["model_id"]):
         print(f"Load Source : {resolved_model_source}")
-    frame_selection = summary.get("frame_selection")
-    if frame_selection is not None:
-        print(f"Video Layer : {frame_selection['_target_']}")
     patch_selection = summary.get("patch_selection")
     if patch_selection is not None:
         print(f"Patch Layer : {patch_selection['_target_']}")
@@ -271,10 +242,9 @@ def main(config: DictConfig) -> None:
     print()
 
     start_time = time.perf_counter()
-    answer_method = vlm.answer_vqa if inference_task == "vqa" else vlm.answer_video
-    response = answer_method(
+    response = vlm.answer_vqa(
         prompt=prompt,
-        **{visual_arg_name: str(visual_path)},
+        image_path=str(visual_path),
     )
     elapsed = time.perf_counter() - start_time
 
