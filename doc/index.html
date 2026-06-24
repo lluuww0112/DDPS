@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DDPS: Train-Free Patch Selection for Efficient Video-LLMs</title>
+  <meta
+    name="description"
+    content="A glassmorphism-style landing page for DDPS, summarizing the method, the intuition, and the efficiency-performance trade-off."
+  >
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@400;600;700;800&display=swap"
+    rel="stylesheet"
+  >
+  <link rel="stylesheet" href="./ddps-results.css">
+</head>
+<body>
+  <canvas class="bg-particles" id="bg-particles" aria-hidden="true"></canvas>
+  <div class="bg-aurora" aria-hidden="true"></div>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-beam beam-a" aria-hidden="true"></div>
+  <div class="bg-beam beam-b" aria-hidden="true"></div>
+  <div class="bg-orb orb-a"></div>
+  <div class="bg-orb orb-b"></div>
+  <div class="bg-orb orb-c"></div>
+
+  <header class="topbar glass">
+    <div class="brand-block">
+      <span class="brand-mark">DDPS</span>
+      <div>
+        <p class="brand-title">Train-Free Patch Selection for Efficient Video-LLMs</p>
+        <p class="brand-subtitle">Interactive project page for GitHub Pages</p>
+      </div>
+    </div>
+
+    <div class="topbar-side">
+      <nav class="topnav">
+        <a href="#overview">Overview</a>
+        <a href="#method">Method</a>
+        <a href="#results">Results</a>
+        <a href="#efficiency">Efficiency</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="site-shell">
+    <section id="overview" class="hero">
+      <article class="hero-copy glass">
+        <h1>
+          <span class="hero-line hero-line-title"><span class="hero-ddps">DDPS</span> : <span class="hero-emphasis">Dynamic Dense Patch Selection</span></span>
+          <span class="hero-line">Keep the <span class="hero-emphasis">patches that matter.</span></span>
+        </h1>
+        <p class="lead">
+          DDPS is a train-free, plug-and-play visual token selection strategy that keeps
+          only query-relevant patches before the visual sequence ever reaches the LLM.
+          Instead of waiting for internal attention maps, DDPS reduces the sequence at
+          the input stage and retains only the visual evidence that actually supports
+          video reasoning.
+        </p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#results">See benchmark results</a>
+          <a class="button button-secondary" href="#method">See how it works</a>
+        </div>
+        <div class="tag-row">
+          <span>Train-Free</span>
+          <span>Plug-and-Play</span>
+          <span>Qwen3-VL-8B</span>
+        </div>
+      </article>
+
+      <aside class="hero-board glass">
+        <div class="board-header">
+          <span class="board-kicker">Best Practical Setting</span>
+        </div>
+        <div class="stat-grid">
+          <article class="stat-card">
+            <span>Token Retention</span>
+            <strong>7.5%</strong>
+            <p>Final visual token share retained from the original patch sequence.</p>
+          </article>
+          <article class="stat-card">
+            <span>Average Gap</span>
+            <strong>+0.26%</strong>
+            <p>Average benchmark gap while keeping only a small subset of tokens.</p>
+          </article>
+          <article class="stat-card">
+            <span>Prefill</span>
+            <strong>67.0 ms</strong>
+            <p>Lower than the 188.9 ms baseline prefill latency.</p>
+          </article>
+          <article class="stat-card">
+            <span>TFLOPs</span>
+            <strong>13.48</strong>
+            <p>Even the cost of frame duplication is more than offset.</p>
+          </article>
+        </div>
+      </aside>
+    </section>
+
+    <section class="section-grid">
+      <article class="glass content-panel">
+        <div class="section-heading">
+          <p class="eyebrow">Why This Matters</p>
+          <h2 class="compact-card-title">Why reduce visual tokens<br />before the LLM?</h2>
+        </div>
+        <div class="problem-grid">
+          <article class="problem-card">
+            <span>01</span>
+            <h3>Most video patches are irrelevant</h3>
+            <p>Only a small fraction of spatial patches actually contributes to answering a query.</p>
+          </article>
+          <article class="problem-card">
+            <span>02</span>
+            <h3>Late pruning still pays early cost</h3>
+            <p>Methods that rely on internal attention still spend expensive full-sequence computation before pruning.</p>
+          </article>
+          <article class="problem-card">
+            <span>03</span>
+            <h3>Deployment should stay simple</h3>
+            <p>Extra training and model surgery reduce the practicality of token reduction methods in real systems.</p>
+          </article>
+        </div>
+      </article>
+
+      <article class="glass image-panel">
+        <div class="section-heading">
+          <p class="eyebrow">Core Observation</p>
+          <h2 class="compact-card-title">Query-relevant visual evidence<br />is usually local</h2>
+        </div>
+        <div class="image-frame">
+          <img src="./assets/task_relevant_visual_tokens_weather.png" alt="Example showing that only a small subset of visual tokens is needed for weather-related reasoning">
+        </div>
+        <p class="image-caption">
+          For a query such as “What is the weather like outside?”, the model only needs the
+          window region and the outdoor area, not every patch in the frame. The sofa, table,
+          ceiling, and interior wall contribute little to the answer, while the visible sky,
+          lighting, and scene outside the window contain most of the evidence needed for
+          correct reasoning.
+        </p>
+      </article>
+    </section>
+
+    <section id="method" class="section-stack">
+      <div class="section-heading section-heading-wide">
+        <p class="eyebrow">Method</p>
+        <h2>How DDPS works</h2>
+        <p class="section-copy section-copy-wide">
+          DDPS computes patch-text relevance before LLM inference,
+          <br />
+          combines it with frame-level importance and dynamically allocates a token budget across frames.
+        </p>
+      </div>
+
+      <div class="method-layout">
+        <article class="glass overview-panel">
+          <div class="panel-topline">
+            <span>Pipeline Overview</span>
+          </div>
+          <div class="image-frame image-frame-wide image-frame-white">
+            <img src="./assets/DDPS_overview.svg" alt="DDPS overview diagram">
+          </div>
+          <p class="image-caption">
+            Unlike methods that first run shallow LLM layers to obtain attention scores,
+            DDPS reduces the visual sequence before the LLM input stage and therefore cuts
+            early full-sequence computation directly. It first measures patch-text relevance
+            in an external aligned vision-language space, then combines those patch scores
+            with frame-level importance, and finally allocates the visual token budget
+            dynamically across frames before the selected tokens are sent to the Video-LLM.
+          </p>
+        </article>
+
+        <article class="glass flow-panel">
+          <div class="panel-topline">
+            <span>4-Step Flow</span>
+          </div>
+          <div class="flow-visual">
+            <div class="visual-stage">
+              <div class="step-index">1</div>
+              <span class="visual-stage-label">Patch-language alignment</span>
+              <div class="visual-stage-art visual-patches">
+                <div class="query-chip">Query</div>
+                <div class="patch-grid">
+                  <span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span>
+                </div>
+              </div>
+            </div>
+            <div class="visual-stage">
+              <div class="step-index">2</div>
+              <span class="visual-stage-label">Patch-text similarity</span>
+              <div class="visual-stage-art visual-similarity">
+                <div class="score-bar score-bar-high"></div>
+                <div class="score-bar score-bar-mid"></div>
+                <div class="score-bar score-bar-high"></div>
+                <div class="score-bar score-bar-low"></div>
+              </div>
+            </div>
+            <div class="visual-stage">
+              <div class="step-index">3</div>
+              <span class="visual-stage-label">Frame-aware budget</span>
+              <div class="visual-stage-art visual-budget">
+                <div class="budget-row"><span class="budget-frame"></span><span class="budget-pill budget-pill-lg"></span></div>
+                <div class="budget-row"><span class="budget-frame"></span><span class="budget-pill budget-pill-md"></span></div>
+                <div class="budget-row"><span class="budget-frame"></span><span class="budget-pill budget-pill-sm"></span></div>
+              </div>
+            </div>
+            <div class="visual-stage">
+              <div class="step-index">4</div>
+              <span class="visual-stage-label">Pre-LLM selection</span>
+              <div class="visual-stage-art visual-output">
+                <div class="selected-grid">
+                  <span></span><span></span><span></span>
+                  <span></span><span></span><span></span>
+                </div>
+                <div class="llm-pill">Video-LLM</div>
+              </div>
+            </div>
+          </div>
+          <div class="flow-list">
+            <div class="flow-step">
+              <p>Use MaskCLIP-based CLIP ViT-L/14 features to extract patch-level and frame-level aligned representations.</p>
+            </div>
+            <div class="flow-step">
+              <p>Score each patch with respect to the user query using cosine similarity in the shared vision-language space.</p>
+            </div>
+            <div class="flow-step">
+              <p>Distribute the visual budget across frames using frame relevance and the temperature parameter λ = 0.4.</p>
+            </div>
+            <div class="flow-step">
+              <p>Apply threshold τ = 0.02 and keep ratio ρ to keep only useful patches before sending them to the Video-LLM.</p>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="principle-grid">
+        <article class="glass principle-card">
+          <p class="eyebrow">Patch-Level</p>
+          <h3>Select directly from aligned visual evidence</h3>
+          <p>DDPS does not depend on intermediate LLM attention and instead uses an external alignment model to identify useful patches.</p>
+        </article>
+        <article class="glass principle-card">
+          <p class="eyebrow">Frame-Level</p>
+          <h3>Allocate tokens where the query needs them</h3>
+          <p>Frames with higher query relevance receive more of the visual budget instead of enforcing uniform allocation.</p>
+        </article>
+        <article class="glass principle-card">
+          <p class="eyebrow">Backbone-Friendly</p>
+          <h3>Apply without retraining the Video-LLM</h3>
+          <p>The method lives in the input pipeline, which makes it suitable for plug-and-play deployment on existing backbones.</p>
+        </article>
+      </div>
+
+      <div class="detail-grid">
+        <article class="glass formula-panel">
+          <div class="panel-topline">
+            <span>Qwen3-VL-Specific DDPS Setup</span>
+          </div>
+          <div class="bullet-stack">
+            <p>Qwen3-VL internally merges adjacent frames, so sparse uniform sampling can lose temporal evidence when two different sampled frames are compressed together.</p>
+            <p>To avoid that mismatch, DDPS duplicates each sampled frame once so that every frame is merged with an identical copy of itself rather than a different neighbor.</p>
+            <p>Qwen-family models also merge each adjacent 2 × 2 patch group into one visual token. DDPS therefore averages dense patch-text scores over each merge unit and aligns the relevance map to the exact token grid consumed by Qwen3-VL.</p>
+            <p>With this setup, DDPS preserves the temporal information protected by frame duplication while still pruning the merged visual sequence before the Video-LLM processes it.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section-stack">
+      <div class="section-heading section-heading-wide">
+        <p class="eyebrow">Alignment Examples</p>
+        <h2>What DDPS actually keeps</h2>
+        <p class="section-copy">
+          The selected patches concentrate around query-relevant objects and interaction regions,
+          rather than spending budget on background areas.
+        </p>
+      </div>
+
+      <div class="visual-grid">
+        <article class="glass image-panel">
+          <div class="panel-topline">
+            <span>Dense Similarity Map</span>
+          </div>
+          <div class="image-frame image-frame-white">
+            <img src="./assets/maskclip_wall_frame3_comparison.svg" alt="Dense patch-text similarity map for a wall-color query">
+          </div>
+          <p class="image-caption">
+            For the query “The color of the wall.”, the dense patch-text similarity is strongly concentrated on the wall region.
+          </p>
+        </article>
+
+        <article class="glass image-panel">
+          <div class="panel-topline">
+            <span>Selected Patches</span>
+          </div>
+          <div class="image-frame image-frame-white">
+            <img src="./assets/frame2_black_dog_playing_patch_selection.svg" alt="Patch selection example for a dog interaction query">
+          </div>
+          <p class="image-caption">
+            For the query “Which dog is the dog in red clothes playing with?”, only 20 patches are selected out of 256, yet the selected set still preserves the queried dog, its interaction partner, and their contact region.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="results" class="section-stack">
+      <div class="section-heading section-heading-wide">
+        <p class="eyebrow">Benchmark Results</p>
+        <h2>Performance is preserved across keep ratios</h2>
+        <p class="section-copy section-copy-wide">
+          DDPS preserves competitive accuracy even as the keep ratio drops from 0.4 to 0.2,
+          <br />
+          with ρ = 0.3 providing the best overall balance between compression and benchmark performance.
+        </p>
+        <div class="section-links">
+          <a class="button button-secondary" href="./performance_table.html">Open performance table</a>
+          <a class="button button-secondary" href="./efficiency_tables.html">Open efficiency tables</a>
+        </div>
+      </div>
+
+      <div class="results-dashboard-shell">
+        <div class="results-dashboard">
+          <article class="glass table-panel dashboard-panel dashboard-panel-hero">
+            <div class="table-header">
+              <div>
+                <p class="eyebrow">Result Overview</p>
+                <h3>Keep-ratio trade-off at a glance</h3>
+              </div>
+              <p class="table-caption">Main benchmark + keep-ratio summary</p>
+            </div>
+            <div class="ratio-grid dashboard-ratio-grid">
+              <article class="glass ratio-card ratio-card-focus">
+                <span>Recommended</span>
+                <strong>ρ = 0.3</strong>
+                <p>7.5% tokens with a +0.26% average benchmark gap.</p>
+              </article>
+              <article class="glass ratio-card">
+                <span>Higher Accuracy</span>
+                <strong>ρ = 0.4</strong>
+                <p>10.0% tokens with a +0.56% average benchmark gap.</p>
+              </article>
+              <article class="glass ratio-card">
+                <span>Stronger Compression</span>
+                <strong>ρ = 0.2</strong>
+                <p>5.0% tokens with only a modest -0.40% average gap.</p>
+              </article>
+            </div>
+            <div class="table-header">
+              <div>
+                <p class="eyebrow">Main Benchmark Table</p>
+                <h3>Qwen3-VL-8B + DDPS</h3>
+              </div>
+              <p class="table-caption">NeXT-QA, EgoSchema, and VideoMME</p>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Method</th>
+                    <th>Params</th>
+                    <th>Keep</th>
+                    <th>Token Ratio</th>
+                    <th>NeXT-QA</th>
+                    <th>EgoSchema</th>
+                    <th>VideoMME</th>
+                    <th>Avg. Gap</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Baseline (Qwen3-VL)</td>
+                    <td>8B</td>
+                    <td>-</td>
+                    <td>12.5%</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">78.02%</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">62.90%</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">57.78%</span>
+                      </div>
+                    </td>
+                    <td>-</td>
+                  </tr>
+                  <tr>
+                    <td>+ Frame Dup Only</td>
+                    <td>8B</td>
+                    <td>-</td>
+                    <td>25.0%</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">80.02%</span>
+                        <span class="metric-delta metric-delta-pos">+2.00</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">65.60%</span>
+                        <span class="metric-delta metric-delta-pos">+2.70</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">59.94%</span>
+                        <span class="metric-delta metric-delta-pos">+2.16</span>
+                      </div>
+                    </td>
+                    <td>+2.29%</td>
+                  </tr>
+                  <tr class="row-soft">
+                    <td>+ DDPS (Ours)</td>
+                    <td>8B</td>
+                    <td>0.4</td>
+                    <td>10.0%</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">78.08%</span>
+                        <span class="metric-delta metric-delta-pos">+0.06</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">64.64%</span>
+                        <span class="metric-delta metric-delta-pos">+1.74</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">57.66%</span>
+                        <span class="metric-delta metric-delta-neg">-0.12</span>
+                      </div>
+                    </td>
+                    <td>+0.56%</td>
+                  </tr>
+                  <tr class="row-focus">
+                    <td>+ DDPS (Ours)</td>
+                    <td>8B</td>
+                    <td>0.3</td>
+                    <td>7.5%</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">77.62%</span>
+                        <span class="metric-delta metric-delta-neg">-0.40</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">64.38%</span>
+                        <span class="metric-delta metric-delta-pos">+1.48</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">57.48%</span>
+                        <span class="metric-delta metric-delta-neg">-0.30</span>
+                      </div>
+                    </td>
+                    <td>+0.26%</td>
+                  </tr>
+                  <tr class="row-soft">
+                    <td>+ DDPS (Ours)</td>
+                    <td>8B</td>
+                    <td>0.2</td>
+                    <td>5.0%</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">76.94%</span>
+                        <span class="metric-delta metric-delta-neg">-1.08</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">63.72%</span>
+                        <span class="metric-delta metric-delta-pos">+0.82</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">56.83%</span>
+                        <span class="metric-delta metric-delta-neg">-0.95</span>
+                      </div>
+                    </td>
+                    <td>-0.40%</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article id="efficiency" class="glass table-panel dashboard-panel dashboard-panel-wide">
+            <div class="table-header">
+              <div>
+                <p class="eyebrow">Visual Token Usage</p>
+                <h3>How aggressively the sequence shrinks</h3>
+              </div>
+              <p class="table-caption">Uniform 10-frame sampling</p>
+            </div>
+            <div class="mini-summary">
+              <div class="mini-chip">
+                <span>Average Total Tokens</span>
+                <strong>2302.68 → 690.24</strong>
+              </div>
+            </div>
+            <div class="table-wrap table-wrap-tight">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Keep</th>
+                    <th>NeXT-QA</th>
+                    <th>EgoSchema</th>
+                    <th>VideoMME</th>
+                    <th>Avg.</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1.0 (Original)</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">2452.08</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">1769.17</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">2686.79</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">2302.68</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>0.4</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">980.44</span>
+                        <span class="metric-delta metric-delta-good">-1471.64</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">706.09</span>
+                        <span class="metric-delta metric-delta-good">-1063.08</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">1074.43</span>
+                        <span class="metric-delta metric-delta-good">-1612.36</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">920.32</span>
+                        <span class="metric-delta metric-delta-good">-1382.36</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr class="row-focus">
+                    <td>0.3</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">735.33</span>
+                        <span class="metric-delta metric-delta-good">-1716.75</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">529.57</span>
+                        <span class="metric-delta metric-delta-good">-1239.60</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">805.82</span>
+                        <span class="metric-delta metric-delta-good">-1880.97</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">690.24</span>
+                        <span class="metric-delta metric-delta-good">-1612.44</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>0.2</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">490.22</span>
+                        <span class="metric-delta metric-delta-good">-1961.86</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">353.05</span>
+                        <span class="metric-delta metric-delta-good">-1416.12</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">537.21</span>
+                        <span class="metric-delta metric-delta-good">-2149.58</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">460.16</span>
+                        <span class="metric-delta metric-delta-good">-1842.52</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="glass table-panel dashboard-panel">
+            <div class="table-header">
+              <div>
+                <p class="eyebrow">Compute Cost</p>
+                <h3>Prefill latency and TFLOPs</h3>
+              </div>
+              <p class="table-caption">Measured on NeXT-QA</p>
+            </div>
+            <div class="mini-summary">
+              <div class="mini-chip">
+                <span class="mini-chip-label-white">Baseline</span>
+                <strong>
+                  <span class="mini-chip-metric">188.9 ms</span>
+                  <span class="mini-chip-separator">/</span>
+                  <span class="mini-chip-metric">25.60 TFLOPs</span>
+                </strong>
+              </div>
+              <div class="mini-chip">
+                <span class="mini-chip-label-white">DDPS (keep=0.3)</span>
+                <strong>
+                  <span class="mini-chip-metric">67.0 ms</span>
+                  <span class="mini-chip-separator">/</span>
+                  <span class="mini-chip-metric">13.48 TFLOPs</span>
+                </strong>
+              </div>
+            </div>
+            <div class="table-wrap table-wrap-tight table-wrap-fit">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Setting</th>
+                    <th>Keep</th>
+                    <th>Prefill (ms)</th>
+                    <th>TFLOPs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Baseline (w/o dup.)</td>
+                    <td>-</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">188.9</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">25.60</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>+ Frame Dup Only</td>
+                    <td>-</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">398.6</span>
+                        <span class="metric-delta metric-delta-bad">+209.7</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">51.88</span>
+                        <span class="metric-delta metric-delta-bad">↑ 2.03x</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>+ DDPS (Ours)</td>
+                    <td>0.4</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">89.0</span>
+                        <span class="metric-delta metric-delta-good">-99.9</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">17.24</span>
+                        <span class="metric-delta metric-delta-good">↓ 1.48x</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr class="row-focus">
+                    <td>+ DDPS (Ours)</td>
+                    <td>0.3</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">67.0</span>
+                        <span class="metric-delta metric-delta-good">-121.9</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">13.48</span>
+                        <span class="metric-delta metric-delta-good">↓ 1.90x</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>+ DDPS (Ours)</td>
+                    <td>0.2</td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">57.0</span>
+                        <span class="metric-delta metric-delta-good">-131.9</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="metric-cell">
+                        <span class="metric-value">9.77</span>
+                        <span class="metric-delta metric-delta-good">↓ 2.62x</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="takeaway-list">
+              <div class="takeaway-item">
+                <span>Frame Duplication Only</span>
+                <strong>Accuracy improves, but cost spikes sharply because the sequence becomes much longer.</strong>
+              </div>
+              <div class="takeaway-item">
+                <span>DDPS(keep=0.3)</span>
+                <strong>This is the most convincing balance between preserving accuracy and reducing system cost.</strong>
+              </div>
+              <div class="takeaway-item">
+                <span>DDPS(keep=0.2)</span>
+                <strong>This is the most aggressive compression setting while still keeping the accuracy drop limited.</strong>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    const root = document.documentElement;
+    const particleCanvas = document.getElementById("bg-particles");
+    const reduceMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+    function updateViewportMode() {
+      const width = window.innerWidth;
+      let mode = "desktop";
+
+      if (width < 720) {
+        mode = "mobile";
+      } else if (width < 1120) {
+        mode = "tablet";
+      }
+
+      root.dataset.mode = mode;
+    }
+
+    function setupParticles() {
+      if (!particleCanvas) {
+        return;
+      }
+
+      const context = particleCanvas.getContext("2d");
+      if (!context) {
+        return;
+      }
+
+      let animationFrameId = 0;
+      let particles = [];
+      let width = 0;
+      let height = 0;
+      let devicePixelRatio = 1;
+      const particlePalette = [
+        { fill: "115, 231, 255", link: "115, 231, 255" },
+        { fill: "255, 188, 115", link: "255, 188, 115" },
+        { fill: "167, 139, 250", link: "167, 139, 250" },
+      ];
+
+      function createParticle() {
+        const speedScale = Math.random() * 0.35 + 0.15;
+        const palette = particlePalette[Math.floor(Math.random() * particlePalette.length)];
+        return {
+          x: Math.random() * width,
+          y: Math.random() * height,
+          radius: Math.random() * 2.2 + 0.9,
+          alpha: Math.random() * 0.28 + 0.10,
+          vx: (Math.random() - 0.5) * speedScale,
+          vy: (Math.random() - 0.5) * speedScale,
+          drift: Math.random() * Math.PI * 2,
+          driftSpeed: Math.random() * 0.012 + 0.004,
+          fill: palette.fill,
+          link: palette.link,
+        };
+      }
+
+      function resizeParticles() {
+        devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        width = window.innerWidth;
+        height = window.innerHeight;
+        particleCanvas.width = Math.floor(width * devicePixelRatio);
+        particleCanvas.height = Math.floor(height * devicePixelRatio);
+        particleCanvas.style.width = `${width}px`;
+        particleCanvas.style.height = `${height}px`;
+        context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
+        const particleCount = Math.max(28, Math.min(72, Math.floor((width * height) / 22000)));
+        particles = Array.from({ length: particleCount }, createParticle);
+      }
+
+      function drawParticles() {
+        context.clearRect(0, 0, width, height);
+
+        for (const particle of particles) {
+          particle.drift += particle.driftSpeed;
+          particle.x += Math.cos(particle.drift) * 0.16;
+          particle.y += Math.sin(particle.drift * 0.8) * 0.12;
+          particle.x += particle.vx;
+          particle.y += particle.vy;
+
+          if (particle.x < -24) particle.x = width + 24;
+          if (particle.x > width + 24) particle.x = -24;
+          if (particle.y < -24) particle.y = height + 24;
+          if (particle.y > height + 24) particle.y = -24;
+
+          const glow = particle.radius * 7.5;
+          const gradient = context.createRadialGradient(
+            particle.x,
+            particle.y,
+            0,
+            particle.x,
+            particle.y,
+            glow
+          );
+          gradient.addColorStop(0, `rgba(${particle.fill}, ${particle.alpha * 0.55})`);
+          gradient.addColorStop(1, `rgba(${particle.fill}, 0)`);
+
+          context.beginPath();
+          context.fillStyle = gradient;
+          context.arc(particle.x, particle.y, glow, 0, Math.PI * 2);
+          context.fill();
+
+          context.beginPath();
+          context.fillStyle = `rgba(${particle.fill}, ${particle.alpha})`;
+          context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+          context.fill();
+        }
+
+        for (let i = 0; i < particles.length; i += 1) {
+          const a = particles[i];
+          for (let j = i + 1; j < particles.length; j += 1) {
+            const b = particles[j];
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const distance = Math.hypot(dx, dy);
+            if (distance > 132) {
+              continue;
+            }
+
+            const alpha = (1 - distance / 132) * 0.18;
+            context.beginPath();
+            context.strokeStyle = `rgba(${a.link}, ${alpha})`;
+            context.lineWidth = distance < 64 ? 1.05 : 0.65;
+            context.moveTo(a.x, a.y);
+            context.lineTo(b.x, b.y);
+            context.stroke();
+          }
+        }
+
+        animationFrameId = window.requestAnimationFrame(drawParticles);
+      }
+
+      function startParticles() {
+        window.cancelAnimationFrame(animationFrameId);
+        if (reduceMotionQuery.matches) {
+          context.clearRect(0, 0, width, height);
+          return;
+        }
+        drawParticles();
+      }
+
+      resizeParticles();
+      startParticles();
+
+      window.addEventListener("resize", resizeParticles);
+      reduceMotionQuery.addEventListener("change", startParticles);
+    }
+
+    updateViewportMode();
+    setupParticles();
+    window.addEventListener("resize", updateViewportMode);
+  </script>
+</body>
+</html>

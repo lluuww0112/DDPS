@@ -23,7 +23,8 @@ from transformers import (
     ProcessorMixin,
 )
 
-from .Selection.DDPS.selection import PatchSelectionResult, load_image
+from .Selection.common import PatchSelectionResult
+from .Selection.DDPS.selection import load_image
 
 
 PatchSelector = Callable[..., Any]

@@ -13,11 +13,11 @@ experiment: "base" # 사용할 모델 config 파일 이름
 
 vqav2:
   dataset_root: "./data/VQAv2" # split 하위 디렉토리(val/test)를 포함한 VQAv2 루트
-  split: "test" # val은 정답이 있어 로컬 정확도를 바로 계산할 수 있음
+  split: "val" # val은 정답이 있어 로컬 정확도를 바로 계산할 수 있음
   require_answers: false # test는 정답이 없으므로 false; val 로컬 평가에서는 true 권장
   prompt_file: "./model/prompt/short_answer.txt" 
   output_dir: "./eval/result/VQAv2"
-  output_file: "vqav2_test_FastV.jsonl" # output_dir 안에 저장할 디버그/재개용 상세 JSONL 파일명
+  output_file: "vqav2_val_random.jsonl" # output_dir 안에 저장할 디버그/재개용 상세 JSONL 파일명
   resume: true # val/test 결과가 섞이지 않도록 기본은 새로 평가
   start_index: 0
   limit: null
@@ -30,7 +30,7 @@ gqa:
   require_answers: false # val 로컬 평가에서는 true 권장
   prompt_file: "./model/prompt/short_answer.txt" 
   output_dir: "./eval/result/GQA"
-  output_file: "gqa_val_sparseVLM.jsonl"
+  output_file: "gqa_val_random.jsonl"
   resume: true
   start_index: 0
   limit: null
