@@ -1,7 +1,7 @@
+from ..common import PatchSelectionResult
 from .clip_model import CLIPTextModel, CLIPVisionModelV2
 from .selection import (
     ImageSelectionResult,
-    PatchSelectionResult,
     identity_patch_selection,
     infer_feature_grid,
     load_image,

@@ -13,6 +13,7 @@ from safetensors import safe_open
 from transformers import AutoTokenizer, CLIPImageProcessor
 from transformers.utils.hub import cached_file
 
+from ..common import PatchSelectionResult
 from .clip_model import CLIPTextModel, CLIPVisionModelV2
 
 
@@ -22,12 +23,6 @@ CLIP_DTYPE_MAP = {
     "fp32": torch.float32,
 }
 
-
-@dataclass(slots=True)
-class PatchSelectionResult:
-    selected_indices: torch.Tensor | None = None
-    selected_features: torch.Tensor | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
